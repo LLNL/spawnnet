@@ -42,7 +42,7 @@
  * Laboratory (NBCL), headed by Professor Dhabaleswar K. (DK) Panda.
  *
  * For detailed copyright and licensing information, please refer to the
- * copyright file COPYRIGHT in the top level MVAPICH2 directory.
+ * copyright file MVAPICH2_LICENSE in the top level directory.
  *
  */
 
@@ -54,7 +54,7 @@
  * All rights reserved.
  * This file is part of the SpawnNet library.
  * For details, see https://github.com/hpc/spawnnet
- * Please also read this file: LICENSE.TXT.
+ * Please also read the LICENSE file.
 */
 
 #ifndef SPAWN_CLOCK_H

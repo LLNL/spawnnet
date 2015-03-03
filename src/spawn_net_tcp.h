@@ -6,7 +6,7 @@
  * All rights reserved.
  * This file is part of the SpawnNet library.
  * For details, see https://github.com/hpc/spawnnet
- * Please also read this file: LICENSE.TXT.
+ * Please also read the LICENSE file.
 */
 
 #ifndef SPAWN_NET_TCP_H
