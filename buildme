@@ -2,7 +2,7 @@
 
 set -x
 
-export PATH=`pwd`/../autotools/install/bin:$PATH
+export PATH=`pwd`/autotools/install/bin:$PATH
 
 export CFLAGS="-g -O0"
 
