@@ -374,257 +374,6 @@ static inline void recv_window_remove(message_queue_t *q)
 }
 
 /*******************************************
- * Virutal channel functions
- ******************************************/
-
-/* initialize UD VC */
-static void vc_init(vc_t* vc)
-{
-    /* init vc state */
-    vc->state = VC_STATE_INIT;
-    vc->local_closed  = 0;
-    vc->remote_closed = 0;
-
-    /* init remote address info */
-    vc->ah  = NULL;
-    vc->qpn = UINT32_MAX;
-    vc->lid = UINT16_MAX;
-
-    /* init context ids */
-    vc->readid  = UINT64_MAX;
-    vc->writeid = UINT64_MAX;
-
-    /* init sequence numbers */
-    vc->seqnum_next_tosend = 0;
-    vc->seqnum_next_torecv = 0;
-    vc->seqnum_next_toack  = UINT16_MAX;
-    vc->ack_need_tosend    = 0;
-    vc->ack_pending        = 0;
-
-    /* init message queues */
-    MESSAGE_QUEUE_INIT(&(vc->send_window));
-    MESSAGE_QUEUE_INIT(&(vc->ext_window));
-    MESSAGE_QUEUE_INIT(&(vc->recv_window));
-    MESSAGE_QUEUE_INIT(&(vc->app_recv_window));
-
-    /* init profile counters */
-    vc->cntl_acks          = 0; 
-    vc->resend_count       = 0;
-    vc->ext_win_send_count = 0;
-
-    return;
-}
-
-/* allocate and initialize a new VC */
-static vc_t* vc_alloc()
-{
-    /* get a new id */
-    uint64_t id = g_ud_vc_info_id;
-
-    /* increment our counter for next time */
-    g_ud_vc_info_id++;
-
-    /* check whether we need to allocate more vc strucutres */
-    if (id >= g_ud_vc_infos) {
-        /* increase capacity of array */
-        if (g_ud_vc_infos > 0) {
-            g_ud_vc_infos *= 2;
-        } else {
-            g_ud_vc_infos = 1;
-        }
-
-        /* allocate space to hold vc pointers */
-        size_t vcsize = g_ud_vc_infos * sizeof(vc_t*);
-        vc_t** vcs = (vc_t**) SPAWN_MALLOC(vcsize);
-
-        /* copy old values into new array */
-        uint64_t i;
-        for (i = 0; i < id; i++) {
-            vcs[i] = g_ud_vc_info[i];
-        }
-
-        /* free old array and assign it to new copy */
-        spawn_free(&g_ud_vc_info);
-        g_ud_vc_info = vcs;
-    }
-
-    /* allocate vc structure */
-    vc_t* vc = (vc_t*) SPAWN_MALLOC(sizeof(vc_t));
-
-    /* initialize vc */
-    vc_init(vc);
-
-    /* record address of vc in array */
-    g_ud_vc_info[id] = vc;
-
-    /* set our read id, other end of channel will label its outgoing
-     * messages with this id when sending to us (our readid is their
-     * writeid) */
-    vc->readid = id;
-
-    /* initialize our read count to 0 */
-    vc->nread = 0;
-
-    /* return vc to caller */
-    return vc;
-}
-
-/* release vc back to pool if we can */
-static void vc_free(vc_t* vc)
-{
-    /* TODO: we can release vc only when: both local and remote
-     * procs have disconnected and all packets have been acked,
-     * but what to do with received data not read by user? */
-    if (vc->local_closed && vc->remote_closed) {
-        /* get id from vc */
-        uint64_t id = vc->readid;
-
-        /* clear this vc from our array */
-        g_ud_vc_info[id] = NULL;
-
-        /* TODO: free off any memory allocated for vc */
-
-        /* delete any messages this vc has on unack'd queue,
-         * any items on unack'd queue will be on vc send queue
-         * iterate over all items on send queue and remove them
-         * from unack'd queue */
-
-        /* release vbufs on send window and remove from unack'd queue */
-        message_queue_t* sendwin = &vc->send_window;
-        vbuf* cur = sendwin->head;
-        while (cur != NULL) {
-            /* get pointer to next element in list */
-            vbuf* next = cur->sendwin_msg.next;
-    
-            /* remove packet from UD context unack'd queue */
-            unack_queue_remove(&proc.unack_queue, cur);
-    
-            /* release vbuf */
-            vbuf_release(cur);
-
-            /* get next packet in send window */
-            cur = next;
-        }
-
-        /* release vbufs from extended queue */
-        message_queue_t* extwin = &vc->ext_window;
-        cur = extwin->head;
-        while (cur != NULL) {
-            /* get pointer to next element in list */
-            vbuf* next = cur->extwin_msg.next;
-
-            /* release vbuf */
-            vbuf_release(cur);
-
-            /* go on to next item */
-            cur = next;
-        }
-
-        /* release vbufs from app receive queue */
-        message_queue_t* apprecvwin = &vc->app_recv_window;
-        cur = apprecvwin->head;
-        while (cur != NULL) {
-            /* get pointer to next element in list */
-            vbuf* next = cur->apprecvwin_msg.next;
-
-            /* release vbuf */
-            vbuf_release(cur);
-
-            /* go on to next item */
-            cur = next;
-        }
-
-        /* release vbufs from out-of-order receive queue */
-        message_queue_t* recvwin = &vc->recv_window;
-        cur = recvwin->head;
-        while (cur != NULL) {
-            /* get pointer to next element in list */
-            vbuf* next = cur->recvwin_msg.next;
-
-            /* release vbuf */
-            vbuf_release(cur);
-
-            /* go on to next item */
-            cur = next;
-        }
-
-        /* destroy address handle */
-        if (vc->ah != NULL) {
-            int ret = ibv_destroy_ah(vc->ah);
-            if (ret != 0) {
-                SPAWN_ERR("Error in destroying address handle (ibv_destroy_ah rc=%d %s)", ret, strerror(ret));
-            }
-            vc->ah = NULL;
-        }
-
-        /* free vc object */
-        spawn_free(&vc);
-    }
-
-    return;
-}
-
-/* called by main thread when destroying UD context to clean up
- * remaining active vcs, which may still exist because they
- * had messages on the unack'd queue when disconnected */
-static int vc_free_all()
-{
-    /* iterate over all possible vc's */
-    int i;
-    for (i = 0; i < g_ud_vc_info_id; i++) {
-        vc_t* vc = g_ud_vc_info[i];
-        if (vc != NULL) {
-            /* to get here, both sides are closed */
-            vc->local_closed = 1;
-            vc->remote_closed = 1;
-            vc_free(vc);
-        }
-    }
-}
-
-static int vc_set_addr(vc_t* vc, ud_addr *rem_info, int port)
-{
-    /* don't bother to set anything if the state is already connecting
-     * or connected */
-    if (vc->state == VC_STATE_CONNECTING ||
-        vc->state == VC_STATE_CONNECTED)
-    {
-        /* duplicate message - return */
-        return 0;
-    }
-
-    /* clear address handle attribute structure */
-    struct ibv_ah_attr ah_attr;
-    memset(&ah_attr, 0, sizeof(ah_attr));
-
-    /* initialize attribute values */
-    /* TODO: set grh field? */
-    ah_attr.dlid          = rem_info->lid;
-    ah_attr.sl            = RDMA_DEFAULT_SERVICE_LEVEL;
-    ah_attr.src_path_bits = 0; 
-    /* TODO: set static_rate field? */
-    ah_attr.is_global     = 0; 
-    ah_attr.port_num      = port;
-
-    /* create IB address handle and record in vc */
-    vc->ah = ibv_create_ah(g_hca_info.pd, &ah_attr);
-    if(vc->ah == NULL){    
-        /* TODO: man page doesn't say anything about errno */
-        SPAWN_ERR("Error in creating address handle (ibv_create_ah errno=%d %s)", errno, strerror(errno));
-        return -1;
-    }
-
-    /* change vc state to "connecting" */
-    vc->state = VC_STATE_CONNECTING;
-
-    /* record remote lid and qpn in vc */
-    vc->lid = rem_info->lid;
-    vc->qpn = rem_info->qpn;
-
-    return 0;
-}
-
-/*******************************************
  * vbuf functions
  ******************************************/
 
@@ -1009,6 +758,257 @@ static inline void vbuf_prepare_send(vbuf* v, unsigned long len)
     v->desc.u.sr.send_flags = IBV_SEND_SIGNALED;
 
     return;
+}
+
+/*******************************************
+ * Virutal channel functions
+ ******************************************/
+
+/* initialize UD VC */
+static void vc_init(vc_t* vc)
+{
+    /* init vc state */
+    vc->state = VC_STATE_INIT;
+    vc->local_closed  = 0;
+    vc->remote_closed = 0;
+
+    /* init remote address info */
+    vc->ah  = NULL;
+    vc->qpn = UINT32_MAX;
+    vc->lid = UINT16_MAX;
+
+    /* init context ids */
+    vc->readid  = UINT64_MAX;
+    vc->writeid = UINT64_MAX;
+
+    /* init sequence numbers */
+    vc->seqnum_next_tosend = 0;
+    vc->seqnum_next_torecv = 0;
+    vc->seqnum_next_toack  = UINT16_MAX;
+    vc->ack_need_tosend    = 0;
+    vc->ack_pending        = 0;
+
+    /* init message queues */
+    MESSAGE_QUEUE_INIT(&(vc->send_window));
+    MESSAGE_QUEUE_INIT(&(vc->ext_window));
+    MESSAGE_QUEUE_INIT(&(vc->recv_window));
+    MESSAGE_QUEUE_INIT(&(vc->app_recv_window));
+
+    /* init profile counters */
+    vc->cntl_acks          = 0; 
+    vc->resend_count       = 0;
+    vc->ext_win_send_count = 0;
+
+    return;
+}
+
+/* allocate and initialize a new VC */
+static vc_t* vc_alloc()
+{
+    /* get a new id */
+    uint64_t id = g_ud_vc_info_id;
+
+    /* increment our counter for next time */
+    g_ud_vc_info_id++;
+
+    /* check whether we need to allocate more vc strucutres */
+    if (id >= g_ud_vc_infos) {
+        /* increase capacity of array */
+        if (g_ud_vc_infos > 0) {
+            g_ud_vc_infos *= 2;
+        } else {
+            g_ud_vc_infos = 1;
+        }
+
+        /* allocate space to hold vc pointers */
+        size_t vcsize = g_ud_vc_infos * sizeof(vc_t*);
+        vc_t** vcs = (vc_t**) SPAWN_MALLOC(vcsize);
+
+        /* copy old values into new array */
+        uint64_t i;
+        for (i = 0; i < id; i++) {
+            vcs[i] = g_ud_vc_info[i];
+        }
+
+        /* free old array and assign it to new copy */
+        spawn_free(&g_ud_vc_info);
+        g_ud_vc_info = vcs;
+    }
+
+    /* allocate vc structure */
+    vc_t* vc = (vc_t*) SPAWN_MALLOC(sizeof(vc_t));
+
+    /* initialize vc */
+    vc_init(vc);
+
+    /* record address of vc in array */
+    g_ud_vc_info[id] = vc;
+
+    /* set our read id, other end of channel will label its outgoing
+     * messages with this id when sending to us (our readid is their
+     * writeid) */
+    vc->readid = id;
+
+    /* initialize our read count to 0 */
+    vc->nread = 0;
+
+    /* return vc to caller */
+    return vc;
+}
+
+/* release vc back to pool if we can */
+static void vc_free(vc_t* vc)
+{
+    /* TODO: we can release vc only when: both local and remote
+     * procs have disconnected and all packets have been acked,
+     * but what to do with received data not read by user? */
+    if (vc->local_closed && vc->remote_closed) {
+        /* get id from vc */
+        uint64_t id = vc->readid;
+
+        /* clear this vc from our array */
+        g_ud_vc_info[id] = NULL;
+
+        /* TODO: free off any memory allocated for vc */
+
+        /* delete any messages this vc has on unack'd queue,
+         * any items on unack'd queue will be on vc send queue
+         * iterate over all items on send queue and remove them
+         * from unack'd queue */
+
+        /* release vbufs on send window and remove from unack'd queue */
+        message_queue_t* sendwin = &vc->send_window;
+        vbuf* cur = sendwin->head;
+        while (cur != NULL) {
+            /* get pointer to next element in list */
+            vbuf* next = cur->sendwin_msg.next;
+    
+            /* remove packet from UD context unack'd queue */
+            unack_queue_remove(&proc.unack_queue, cur);
+    
+            /* release vbuf */
+            vbuf_release(cur);
+
+            /* get next packet in send window */
+            cur = next;
+        }
+
+        /* release vbufs from extended queue */
+        message_queue_t* extwin = &vc->ext_window;
+        cur = extwin->head;
+        while (cur != NULL) {
+            /* get pointer to next element in list */
+            vbuf* next = cur->extwin_msg.next;
+
+            /* release vbuf */
+            vbuf_release(cur);
+
+            /* go on to next item */
+            cur = next;
+        }
+
+        /* release vbufs from app receive queue */
+        message_queue_t* apprecvwin = &vc->app_recv_window;
+        cur = apprecvwin->head;
+        while (cur != NULL) {
+            /* get pointer to next element in list */
+            vbuf* next = cur->apprecvwin_msg.next;
+
+            /* release vbuf */
+            vbuf_release(cur);
+
+            /* go on to next item */
+            cur = next;
+        }
+
+        /* release vbufs from out-of-order receive queue */
+        message_queue_t* recvwin = &vc->recv_window;
+        cur = recvwin->head;
+        while (cur != NULL) {
+            /* get pointer to next element in list */
+            vbuf* next = cur->recvwin_msg.next;
+
+            /* release vbuf */
+            vbuf_release(cur);
+
+            /* go on to next item */
+            cur = next;
+        }
+
+        /* destroy address handle */
+        if (vc->ah != NULL) {
+            int ret = ibv_destroy_ah(vc->ah);
+            if (ret != 0) {
+                SPAWN_ERR("Error in destroying address handle (ibv_destroy_ah rc=%d %s)", ret, strerror(ret));
+            }
+            vc->ah = NULL;
+        }
+
+        /* free vc object */
+        spawn_free(&vc);
+    }
+
+    return;
+}
+
+/* called by main thread when destroying UD context to clean up
+ * remaining active vcs, which may still exist because they
+ * had messages on the unack'd queue when disconnected */
+static int vc_free_all()
+{
+    /* iterate over all possible vc's */
+    int i;
+    for (i = 0; i < g_ud_vc_info_id; i++) {
+        vc_t* vc = g_ud_vc_info[i];
+        if (vc != NULL) {
+            /* to get here, both sides are closed */
+            vc->local_closed = 1;
+            vc->remote_closed = 1;
+            vc_free(vc);
+        }
+    }
+}
+
+static int vc_set_addr(vc_t* vc, ud_addr *rem_info, int port)
+{
+    /* don't bother to set anything if the state is already connecting
+     * or connected */
+    if (vc->state == VC_STATE_CONNECTING ||
+        vc->state == VC_STATE_CONNECTED)
+    {
+        /* duplicate message - return */
+        return 0;
+    }
+
+    /* clear address handle attribute structure */
+    struct ibv_ah_attr ah_attr;
+    memset(&ah_attr, 0, sizeof(ah_attr));
+
+    /* initialize attribute values */
+    /* TODO: set grh field? */
+    ah_attr.dlid          = rem_info->lid;
+    ah_attr.sl            = RDMA_DEFAULT_SERVICE_LEVEL;
+    ah_attr.src_path_bits = 0; 
+    /* TODO: set static_rate field? */
+    ah_attr.is_global     = 0; 
+    ah_attr.port_num      = port;
+
+    /* create IB address handle and record in vc */
+    vc->ah = ibv_create_ah(g_hca_info.pd, &ah_attr);
+    if(vc->ah == NULL){    
+        /* TODO: man page doesn't say anything about errno */
+        SPAWN_ERR("Error in creating address handle (ibv_create_ah errno=%d %s)", errno, strerror(errno));
+        return -1;
+    }
+
+    /* change vc state to "connecting" */
+    vc->state = VC_STATE_CONNECTING;
+
+    /* record remote lid and qpn in vc */
+    vc->lid = rem_info->lid;
+    vc->qpn = rem_info->qpn;
+
+    return 0;
 }
 
 /*******************************************
