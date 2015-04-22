@@ -2111,6 +2111,21 @@ static void* timeout_thread_fn(void *arg)
              *   otherwise if timer is not set, set timer
              *   otherwise if timer has expired, break */
             if (force_shutdown) {
+                /* TODO: this is a hacky way to determine this setting,
+                 * would be better to have options at open/connect or
+                 * something like setsockopt */
+                int cancel = 0;
+                char* value = getenv("SPAWNNET_IBUD_RETRY_CANCEL");
+                if (value != NULL) {
+                    cancel = atoi(value);
+                }
+
+                /* exit immediately if cancel is set */
+                if (cancel) {
+                    break;
+                }
+
+                /* otherwise, check some conditions */
                 if (unack_empty) {
                     /* all sent packets have been acked,
                      * and since we're in close no more
@@ -2784,45 +2799,15 @@ static void ud_ctx_destroy(spawn_net_endpoint** pep)
     /* extract context from endpoint */
     ud_ctx_t* ud_ctx = proc.ud_ctx;
 
-    /* signal our threads that we need to shut down */
+    /* signal timeout thread that we need to shut down */
     force_shutdown = 1;
 
-    /* TODO: this is a hacky way to determine this setting,
-     * would be better to have options at open/connect or
-     * something like setsockopt */
-    int cancel = 0;
-    char* value = getenv("SPAWNNET_IBUD_RETRY_CANCEL");
-    if (value != NULL) {
-        cancel = atoi(value);
-    }
-
-    /* stop the retry thread */
-    if (cancel) {
-        /* in this case, we kill the retry thread using pthread_cancel,
-         * we use locks to be sure we cancel thread at a good point */
-        comm_lock();
-
-        /* cancel thread and wait for it to exit */
-        rc = pthread_cancel(timeout_thread);
-        if (rc != 0) {
-            SPAWN_ERR("Failed to cancel resend timeout event thread (pthread_cancel rc=%d %s)", rc, strerror(rc));
-        }
-
-        /* wait for resend thread to return */
-        rc = pthread_join(timeout_thread, NULL);
-        if (rc != 0) {
-            SPAWN_ERR("Failed to join resend timeout event thread (pthread_join rc=%d %s)", rc, strerror(rc));
-        }
-
-        comm_unlock();
-    } else {
-        /* otherwise, wait for resend thread to exit on its own,
-         * if there are unack'd sends, it will retry for some time
-         * before it exits */
-        rc = pthread_join(timeout_thread, NULL);
-        if (rc != 0) {
-            SPAWN_ERR("Failed to join resend timeout event thread (pthread_join rc=%d %s)", rc, strerror(rc));
-        }
+    /* wait for timeout thread to exit on its own,
+     * if there are unack'd sends, it will retry for some time
+     * before it exits */
+    rc = pthread_join(timeout_thread, NULL);
+    if (rc != 0) {
+        SPAWN_ERR("Failed to join resend timeout event thread (pthread_join rc=%d %s)", rc, strerror(rc));
     }
 
     /* shut down receive thread if we have one */

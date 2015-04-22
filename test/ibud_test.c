@@ -5,7 +5,7 @@
 
 #include "mpi.h"
 
-#include "spawn_internal.h"
+#include "spawn.h"
 
 int main(int argc, char* argv[])
 {
@@ -14,6 +14,9 @@ int main(int argc, char* argv[])
   int rank, ranks, iters = 1000;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+
+  /* hacky way to specify endpoint properties */
+  //setenv("SPAWNNET_IBUD_RETRY_CANCEL", "1", 1);
 
   spawn_net_endpoint* ep = spawn_net_open(SPAWN_NET_TYPE_IBUD);
   const char* ep_name = spawn_net_name(ep);
