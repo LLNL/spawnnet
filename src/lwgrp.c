@@ -314,28 +314,37 @@ lwgrp* lwgrp_create(
 
 int lwgrp_free(lwgrp** pgroup)
 {
-  lwgrp* group = *pgroup;
-
-  /* disconnect all channels */
-  int64_t i;
-  for (i = 0; i < group->list_size; i++) {
-    if (group->list_left[i] != SPAWN_NET_CHANNEL_NULL) {
-      spawn_net_disconnect(&group->list_left[i]);
-    }
-
-    if (group->list_right[i] != SPAWN_NET_CHANNEL_NULL) {
-      spawn_net_disconnect(&group->list_right[i]);
-    }
+  /* nothing to do if caller passed in NULL address */
+  if (pgroup == NULL) {
+      return LWGRP_SUCCESS;
   }
 
-  /* free the list of channels */
-  spawn_free(&group->list_right);
-  spawn_free(&group->list_left);
+  /* otherwise, get pointer to group */
+  lwgrp* group = *pgroup;
 
-  /* free the addresses */
-  spawn_free(&group->right);
-  spawn_free(&group->left);
-  spawn_free(&group->name);
+  /* free up resources in group */
+  if (group != NULL) {
+    /* disconnect all channels */
+    int64_t i;
+    for (i = 0; i < group->list_size; i++) {
+      if (group->list_left[i] != SPAWN_NET_CHANNEL_NULL) {
+        spawn_net_disconnect(&group->list_left[i]);
+      }
+
+      if (group->list_right[i] != SPAWN_NET_CHANNEL_NULL) {
+        spawn_net_disconnect(&group->list_right[i]);
+      }
+    }
+
+    /* free the list of channels */
+    spawn_free(&group->list_right);
+    spawn_free(&group->list_left);
+
+    /* free the addresses */
+    spawn_free(&group->right);
+    spawn_free(&group->left);
+    spawn_free(&group->name);
+  }
 
   /* free the group */
   spawn_free(pgroup);
