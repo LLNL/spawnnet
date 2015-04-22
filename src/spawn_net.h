@@ -54,6 +54,9 @@ int spawn_net_close(spawn_net_endpoint** ep);
 /* get name of opened endpoint (pass to others for call to connect) */
 const char* spawn_net_name(const spawn_net_endpoint* ep);
 
+/* given an endpoint, get its type */
+spawn_net_type spawn_net_get_type(const spawn_net_endpoint* ep);
+
 /* connect to named endpoint (name comes from spawn_net_name) */
 spawn_net_channel* spawn_net_connect(const char* name);
 

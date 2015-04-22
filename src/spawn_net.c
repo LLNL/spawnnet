@@ -85,6 +85,18 @@ const char* spawn_net_name(const spawn_net_endpoint* ep)
   return name;
 }
 
+spawn_net_type spawn_net_get_type(const spawn_net_endpoint* ep)
+{
+  /* return NULL for a NULL endpoint */
+  if (ep == SPAWN_NET_ENDPOINT_NULL) {
+    return SPAWN_NET_TYPE_NULL;
+  }
+
+  /* otherwise, return endpoint type */
+  spawn_net_type t = ep->type;
+  return t;
+}
+
 spawn_net_type spawn_net_infer_type(const char* name)
 {
   /* return a NULL channel on connect to NULL name */
