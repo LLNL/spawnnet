@@ -475,7 +475,6 @@ static void vc_free(vc_t* vc)
     /* TODO: we can release vc only when: both local and remote
      * procs have disconnected and all packets have been acked,
      * but what to do with received data not read by user? */
-#if 0
     if (vc->local_closed && vc->remote_closed) {
         /* get id from vc */
         uint64_t id = vc->readid;
@@ -485,13 +484,69 @@ static void vc_free(vc_t* vc)
 
         /* TODO: free off any memory allocated for vc */
 
-        /* TODO: delete items from message queues */
-        vc->send_window;
-        vc->ext_window;
-        vc->recv_window;
-        vc->app_recv_window;
+        /* delete any messages this vc has on unack'd queue,
+         * any items on unack'd queue will be on vc send queue
+         * iterate over all items on send queue and remove them
+         * from unack'd queue */
 
-        /* TODO: delete any items from unack'd queue */
+        /* release vbufs on send window and remove from unack'd queue */
+        message_queue_t* sendwin = &vc->send_window;
+        vbuf* cur = sendwin->head;
+        while (cur != NULL) {
+            /* get pointer to next element in list */
+            vbuf* next = cur->sendwin_msg.next;
+    
+            /* remove packet from UD context unack'd queue */
+            unack_queue_remove(&proc.unack_queue, cur);
+    
+            /* release vbuf */
+            vbuf_release(cur);
+
+            /* get next packet in send window */
+            cur = next;
+        }
+
+        /* release vbufs from extended queue */
+        message_queue_t* extwin = &vc->ext_window;
+        cur = extwin->head;
+        while (cur != NULL) {
+            /* get pointer to next element in list */
+            vbuf* next = cur->extwin_msg.next;
+
+            /* release vbuf */
+            vbuf_release(cur);
+
+            /* go on to next item */
+            cur = next;
+        }
+
+        /* release vbufs from app receive queue */
+        message_queue_t* apprecvwin = &vc->app_recv_window;
+        cur = apprecvwin->head;
+        while (cur != NULL) {
+            /* get pointer to next element in list */
+            vbuf* next = cur->apprecvwin_msg.next;
+
+            /* release vbuf */
+            vbuf_release(cur);
+
+            /* go on to next item */
+            cur = next;
+        }
+
+        /* release vbufs from out-of-order receive queue */
+        message_queue_t* recvwin = &vc->recv_window;
+        cur = recvwin->head;
+        while (cur != NULL) {
+            /* get pointer to next element in list */
+            vbuf* next = cur->recvwin_msg.next;
+
+            /* release vbuf */
+            vbuf_release(cur);
+
+            /* go on to next item */
+            cur = next;
+        }
 
         /* destroy address handle */
         if (vc->ah != NULL) {
@@ -505,9 +560,26 @@ static void vc_free(vc_t* vc)
         /* free vc object */
         spawn_free(&vc);
     }
-#endif
 
     return;
+}
+
+/* called by main thread when destroying UD context to clean up
+ * remaining active vcs, which may still exist because they
+ * had messages on the unack'd queue when disconnected */
+static int vc_free_all()
+{
+    /* iterate over all possible vc's */
+    int i;
+    for (i = 0; i < g_ud_vc_info_id; i++) {
+        vc_t* vc = g_ud_vc_info[i];
+        if (vc != NULL) {
+            /* to get here, both sides are closed */
+            vc->local_closed = 1;
+            vc->remote_closed = 1;
+            vc_free(vc);
+        }
+    }
 }
 
 static int vc_set_addr(vc_t* vc, ud_addr *rem_info, int port)
@@ -1968,6 +2040,14 @@ static int cq_poll(int* got_recv)
                     /* get pointer to vc */
                     vc_t* vc = g_ud_vc_info[index];
 
+                    /* ignore incoming packets destined for vcs
+                     * we've already closed */
+                    if (vc == NULL) {
+                        vbuf_release(v);
+                        v = NULL;
+                        break;
+                    }
+
                     /* for UD packets, check that source lid and source
                      * qpn match expected vc to avoid spoofing */
                     if (vc->lid != wc->slid ||
@@ -2854,6 +2934,12 @@ static void ud_ctx_destroy(spawn_net_endpoint** pep)
     } else {
         SPAWN_ERR("Failed to destroy pthread mutex (pthread_mutex_destroy rc=%d %s)", rc, strerror(rc));
     }
+
+    /* free all vcs (some vcs may have had outstanding sends or
+     * unack'd messages when disconnect was called),
+     * need to do this before vbuf_finalize because releasing vbufs
+     * uses vbuf_lock which is destroyed in vbuf_finalize */
+    vc_free_all();
 
     /* deregister and free memory for vbufs */
     vbuf_finalize();
