@@ -53,9 +53,9 @@ static int64_t g_count_open = 0; /* number of active endpoint opens (spawn_net_o
 static int64_t g_count_conn = 0; /* number of active VC connections (local + remote) */
 static uint64_t g_ud_ep_id  = 0; /* next endpoint id to be assigned */
 
-static mv2_proc_info_t proc;
-static mv2_hca_info_t g_hca_info;
-static ud_addr local_ep_info; /* caches lid and qpn of our UDQP */
+static mv2_proc_info_t proc;      /* contains pointer to UD context structure and unack queue */
+static mv2_hca_info_t g_hca_info; /* tracks ibv structs for HCA (prot domain, device, context, etc) */
+static ud_addr local_ep_info;     /* caches lid and qpn of our UDQP */
 
 /* Tracks an array of virtual channels.  With each new channel created,
  * the id is incremented.  Grows channel array as needed. */
@@ -63,7 +63,12 @@ static vc_t** g_ud_vc_info       = NULL; /* VC array */
 static uint64_t g_ud_vc_infos    = 0;    /* capacity of VC array */
 static uint64_t g_ud_vc_info_id  = 0;    /* next id to be assigned */
 
-/* we create a vc to ourself just to send SHUTDOWN packet to recv thread */
+/* we create a vc to ourself just to send SHUTDOWN packet to recv thread,
+ * this is clumsy, but ibverbs seems to require it since a thread that
+ * blocks on ibv_get_cq_event must acknowledge each event with a call to
+ * ibv_ack_cq_events, which means we can't simply cancel the recv thread,
+ * as it could get cancelled between the get and ack calls, which then
+ * will cause ibv_destroy_cq to hang */
 static vc_t* g_vc_self = NULL;
 static int g_shutdown = 0; /* recv thread will set this flag to one upon handling a shutdown message */
 
@@ -83,23 +88,49 @@ static long rdma_ud_last_check;                  /* time at which we last checke
 static uint16_t rdma_ud_max_retry_count = 1000;  /* max number of resends before tossing packet */
 static uint16_t rdma_ud_max_ack_pending;         /* max number of recieves before forcing an ack */
 
-static struct timespec cm_remain;
-static struct timespec cm_timeout;
-
 static pthread_t recv_thread;    /* thread that handles CQ events */
 static pthread_t timeout_thread; /* thread that resends packets if timeout expires */
 static int force_shutdown = 0;   /* flag indicating caller is in spawn_net_close_ib */
 
 static int g_recv_busy_spin = 0;   /* whether we should busy spin or yield CPU while waiting */
 static int g_recv_flag;            /* flag indicating whether main thread is waiting */
-static pthread_cond_t g_recv_cond; /* condition variable to wait on incoming msg */
+static pthread_cond_t g_recv_cond; /* condition variable main thread uses to wait on incoming msg */
+
+/* this queue tracks a list of pending connect messages,
+ * the accept function pulls items from this list */
+typedef struct connect_list_t {
+    vbuf* v;       /* pointer to vbuf for this message */
+    uint64_t epid; /* local endpoint id */
+    uint32_t lid;  /* requestor lid */
+    uint32_t qpn;  /* requestor queue pair number */
+    uint64_t id;   /* requestor write id to use when sending */
+    char* name;    /* requestor hostname */
+    struct connect_list_t* next; /* pointer to next item in list */
+} connect_list;
+
+static connect_list* connect_head = NULL;
+static connect_list* connect_tail = NULL;
+
+/* tracks list of accepted connection requests, which is used to
+ * filter duplicate connection requests and track active channels
+ * for sending explicit acks */
+typedef struct connected_list_t {
+    unsigned int lid; /* remote LID */
+    unsigned int qpn; /* remote Queue Pair Number */
+    unsigned int id;  /* write id to use to send to remote side */
+    vc_t*  vc;        /* open vc to remote side */
+    struct connected_list_t* next; /* pointer to next item in list */
+} connected_list;
+
+static connected_list* connected_head = NULL;
+static connected_list* connected_tail = NULL;
 
 /*******************************************
  * interface to lock/unlock communication
  ******************************************/
 
-/* this thread is used to ensure main thread and
- * UD progress thread don't step on each other */
+/* this lock is used to ensure main thread, timeout thread,
+ * and recv threads don't step on each other */
 
 static pthread_mutex_t comm_lock_object;
 
@@ -132,6 +163,9 @@ enum {
     MSG_IN_RECVWIN
 };
 
+/* adds vbuf to extended send queue of UD context,
+ * here we overload the ibv_wr_descriptor to create
+ * our linked list of vbufs */
 static inline void ext_sendq_add(message_queue_t *q, vbuf *v)
 {
     v->desc.next = NULL;
@@ -144,18 +178,29 @@ static inline void ext_sendq_add(message_queue_t *q, vbuf *v)
     q->count++;
 }
 
-/* adds vbuf to extended send queue, which tracks messages we will be
- * sending but haven't yet */
+/* adds vbuf to extended send queue of VC, which tracks messages
+ * we will be submitting to UD context but haven't yet */
 static inline void ext_window_add(message_queue_t *q, vbuf *v)
 {
-    v->extwin_msg.next = v->extwin_msg.prev = NULL;
+    /* set packet as last item */
+    //v->extwin_msg.prev = q->tail;
+    v->extwin_msg.prev = NULL;
+    v->extwin_msg.next = NULL;
+
+    /* place packet at front of queue if it's empty,
+     * otherwise update last item to point to this one */   
     if (q->head == NULL) {
         q->head = v;
     } else {
         (q->tail)->extwin_msg.next = v;
     }
+
+    /* update the tail to point to this packet,
+     * and increase the count */
     q->tail = v;
     q->count++;
+
+    return;
 }
 
 /* adds vbuf to the send queue, which tracks packets a VC
@@ -185,7 +230,7 @@ static inline void send_window_add(message_queue_t* q, vbuf* v)
     return;
 }
 
-/* removes vbuf from send queue */
+/* removes vbuf from VC send queue */
 static inline void send_window_remove(message_queue_t* q, vbuf* v)
 {
     /* get pointers to elements on either side of this vbuf */
@@ -223,51 +268,76 @@ static inline void send_window_remove(message_queue_t* q, vbuf* v)
     return;
 }
 
+/* append packet to global unack'd queue */
 static inline void unack_queue_add(message_queue_t *q, vbuf *v)
 {
+    /* set packet as last item */
+    v->unack_msg.prev = q->tail;
     v->unack_msg.next = NULL;
 
+    /* place packet at front of queue if it's empty,
+     * otherwise update last item to point to this one */   
     if (q->head == NULL) {
         q->head = v;
-        v->unack_msg.prev = NULL;
     } else {
         (q->tail)->unack_msg.next = v;
-        v->unack_msg.prev = q->tail;
     }
 
+    /* update the tail to point to this packet,
+     * and increase the count */
     q->tail = v;
     q->count++;
+
+    return;
 }
 
+/* remove specified packet from global unack'd queue */
 static inline void unack_queue_remove(message_queue_t *q, vbuf *v)
 {
-    vbuf *next = v->unack_msg.next;
-    vbuf *prev = v->unack_msg.prev;
+    /* get pointers to elements on either side of this vbuf */
+    vbuf* next = v->unack_msg.next;
+    vbuf* prev = v->unack_msg.prev;
 
-    if (prev == NULL) {
+    /* update head if packet is at start of list */
+    if (q->head == v) {
         q->head = next;
-    } else {
+    }
+
+    /* update tail if packet is at end of list */
+    if (q->tail == v) {
+        q->tail = prev;
+    }
+
+    /* fix up list elements to skip this vbuf */
+    if (prev != NULL) {
         prev->unack_msg.next = next;
     }
-
-    if (next == NULL) {
-        q->tail = prev;
-    } else {
+    if (next != NULL) {
         next->unack_msg.prev = prev;
     }
-    v->unack_msg.next = v->unack_msg.prev = NULL;
+
+    /* decrease the length of the list */
     q->count--;
+
+    /* cleanup linked list fields in vbuf */
+    v->unack_msg.next = NULL;
+    v->unack_msg.prev = NULL;
+
+    return;
 }
 
 static inline int recv_window_add(message_queue_t *q, vbuf *v, int recv_win_start)
 {
     /* clear next and previous pointers in vbuf */
-    v->recvwin_msg.next = v->recvwin_msg.prev = NULL;
+    v->recvwin_msg.next = NULL;
+    v->recvwin_msg.prev = NULL;
 
-    /* insert vbuf into recv queue in order by its sequence number */
+    /* insert vbuf into recv queue in order by its sequence number,
+     * this is a bit tricky since sequence numbers can wrap */
     if(q->head == NULL) {
         /* trivial insert if list is empty */
-        q->head = q->tail = v;
+        q->head = v;
+        q->tail = v;
     } else {
         /* otherwise, we have at least one item already in list,
          * get a pointer to current head */ 
@@ -275,8 +345,8 @@ static inline int recv_window_add(message_queue_t *q, vbuf *v, int recv_win_star
 
         /* if our sequence number is greater than start of window */
         if (v->seqnum > recv_win_start) {
-            /* current seq num is higher than start seq number, */
-            /* iterate until we find the first item in the list
+            /* current seq num is higher than start seq number,
+             * iterate until we find the first item in the list
              * whose sequence number is greater or equal to vbuf,
              * or until we hit first item whose seq wraps (less
              * than or equal to start seq num) */
@@ -363,12 +433,12 @@ static inline int recv_window_add(message_queue_t *q, vbuf *v, int recv_win_star
 /* remove item from head of recv queue */
 static inline void recv_window_remove(message_queue_t *q)
 {
-    vbuf *next = (q->head)->recvwin_msg.next;
+    vbuf* next = (q->head)->recvwin_msg.next;
     q->head = next;
     if (next != NULL) {
         next->recvwin_msg.prev = NULL;
     } else {
-        q->head = q->tail = NULL;
+        q->tail = NULL;
     }
     q->count--;
 }
@@ -379,11 +449,9 @@ static inline void recv_window_remove(message_queue_t *q)
 
 /* Vbufs are allocated in blocks called "regions".
  * Regions are linked together into a list.
- *
- * These data structures record information on all the vbuf
- * regions that have been allocated.  They can be used for
- * error checking and to un-register and deallocate the regions
- * at program termination.  */
+ * Details for each region is contained in the following
+ * data structure which is used for error checking and
+ * to deregister and deallocate the regions.  */
 typedef struct vbuf_region {
     struct ibv_mr* mem_handle; /* mem hndl for entire region */
     void* malloc_start;        /* used to free region later */
@@ -392,7 +460,7 @@ typedef struct vbuf_region {
     void* malloc_buf_end;      /* bracket DMA region */
     int count;                 /* number of vbufs in region */
     struct vbuf* vbuf_head;    /* first vbuf in region */
-    struct vbuf_region* next;  /* thread vbuf regions */
+    struct vbuf_region* next;  /* link to next vbuf region in list */
     int shmid;                 /* track shared memory id for huge pages */
 } vbuf_region;
 
@@ -474,10 +542,12 @@ static int vbuf_finalize()
   return 0;
 }
 
+/* for better performance, it's useful to allocate communication
+ * buffers in huge pages */
 static int alloc_hugepage_region(int *shmid, void **buffer, int *nvbufs, int buf_size)
 {
     int ret = 0;
-    size_t size = *nvbufs * buf_size;
+    size_t size = (*nvbufs) * buf_size;
     MRAILI_ALIGN_LEN(size, HUGEPAGE_ALIGN);
 
     /* create hugepage shared region */
@@ -512,6 +582,7 @@ static int alloc_hugepage_region(int *shmid, void **buffer, int *nvbufs, int buf
      
 fn_exit:
     return ret;
+
 fn_fail:
     ret = -1;
     if (rdma_enable_hugepage >= 2) {
@@ -564,6 +635,7 @@ static int vbuf_region_alloc(struct ibv_pd* pdomain, int nvbufs)
     void* vbufs;
     result = posix_memalign((void**) &vbufs, alignment_vbuf, vbufs_size);
     if (result != 0) {
+        /* TODO: free dmabufs */
         SPAWN_ERR("Cannot allocate vbuf region (posix_memalign rc=%d %s)", result, strerror(result));
         return -1;
     }
@@ -577,11 +649,11 @@ static int vbuf_region_alloc(struct ibv_pd* pdomain, int nvbufs)
     }
     
     /* clear memory regions */
-    memset(vbufs,             0, vbufs_size);
+    memset(vbufs,  0, vbufs_size);
     memset(dmabuf, 0, dmabuf_size);
 
     /* update global vbuf variables */
-    ud_vbuf_free_head      = vbufs;
+    ud_vbuf_free_head      = (vbuf*) vbufs;
     ud_vbuf_num_allocated += nvbufs;
     ud_vbuf_num_free      += nvbufs;
 
@@ -710,6 +782,7 @@ static void vbuf_release(vbuf* v)
     return;
 }
 
+/* prepare ibv_wr_descriptor for receive operation */
 static inline void vbuf_prepare_recv(vbuf* v, unsigned long len)
 {
     assert(v != NULL);
@@ -734,6 +807,7 @@ static inline void vbuf_prepare_recv(vbuf* v, unsigned long len)
     return;
 }
 
+/* prepare ibv_wr_descriptor for send operation */
 static inline void vbuf_prepare_send(vbuf* v, unsigned long len)
 {
     /* describe data to be sent */
@@ -856,18 +930,146 @@ static vc_t* vc_alloc()
     return vc;
 }
 
+/* delete any entries on UD contenxt extended send queue for VC,
+ * and also delete from VC's send window, these messages have
+ * been submitted to the UD context, but not yet sent */
+static void vc_purge_ud_extsend(vc_t* vc)
+{
+    /* get pointer to UD extended send queue */
+    message_queue_t* q = &proc.ud_ctx->ext_send_queue;
+
+    vbuf* prev = NULL;
+    vbuf* cur  = q->head;
+    while (cur != NULL) {
+        /* get pointer to next item on list */
+        vbuf* next = cur->desc.next;
+
+        /* check whether the current item belongs to the target vc */
+        if (cur->vc == vc) {
+            /* found an item in the UD context extended send queue
+             * belonging to this vc, extract it from the list */
+
+            /* this item will also be in VC's send window,
+             * so let's also remove it from there */
+            send_window_remove(&vc->send_window, cur);
+
+            /* extract vbuf from queue */
+            if (q->head == cur) {
+                /* item is at start of list, make next item the new head */
+                q->head = next;
+            } else {
+                /* otherwise, update previous item to point to next item */
+                prev->desc.next = next;
+            }
+
+            /* update tail if needed */
+            if (q->tail == cur) {
+                q->tail = prev;
+            }
+
+            /* subtract one from number of items in list */
+            q->count--;
+
+            /* clear pointer just to be clean about things */
+            cur->desc.next = NULL;
+        } else {
+            /* only update previous to current if
+             * we didn't pitch current */
+            prev = cur;
+        }
+
+        /* go on to process next item in the list */
+        cur  = next;
+    }
+
+    return;
+}
+
+static void vc_purge_queues(vc_t* vc)
+{
+    /* release vbufs on send window and remove from unack'd queue */
+    message_queue_t* sendwin = &vc->send_window;
+    vbuf* cur = sendwin->head;
+    while (cur != NULL) {
+        /* get pointer to next element in list */
+        vbuf* next = cur->sendwin_msg.next;
+   
+//        cur->sendwin_msg.next = cur->sendwin_msg.prev = NULL;
+
+        /* remove packet from UD context unack'd queue */
+        unack_queue_remove(&proc.unack_queue, cur);
+   
+        /* release vbuf */
+//        vbuf_release(cur);
+
+        /* get next packet in send window */
+        cur = next;
+    }
+
+    /* release vbufs from extended queue */
+    message_queue_t* extwin = &vc->ext_window;
+    cur = extwin->head;
+    while (cur != NULL) {
+        /* get pointer to next element in list */
+        vbuf* next = cur->extwin_msg.next;
+
+//        cur->extwin_msg.next = cur->extwin_msg.prev = NULL;
+
+        /* release vbuf */
+//        vbuf_release(cur);
+
+        /* go on to next item */
+        cur = next;
+    }
+
+    /* release vbufs from app receive queue */
+    message_queue_t* apprecvwin = &vc->app_recv_window;
+    cur = apprecvwin->head;
+    while (cur != NULL) {
+        /* get pointer to next element in list */
+        vbuf* next = cur->apprecvwin_msg.next;
+
+        /* release vbuf */
+        vbuf_release(cur);
+
+        /* clear pointer fields in vbuf */
+        cur->apprecvwin_msg.next = NULL;
+        cur->apprecvwin_msg.prev = NULL;
+
+        /* go on to next item */
+        cur = next;
+    }
+
+    /* release vbufs from out-of-order receive queue */
+    message_queue_t* recvwin = &vc->recv_window;
+    cur = recvwin->head;
+    while (cur != NULL) {
+        /* get pointer to next element in list */
+        vbuf* next = cur->recvwin_msg.next;
+
+        /* release vbuf */
+        vbuf_release(cur);
+
+        /* clear pointer fields in vbuf */
+        cur->apprecvwin_msg.next = NULL;
+        cur->apprecvwin_msg.prev = NULL;
+
+        /* go on to next item */
+        cur = next;
+    }
+
+    return;
+}
+
 /* release vc back to pool if we can */
 static void vc_free(vc_t* vc)
 {
-    /* TODO: we can release vc only when: both local and remote
+    /* TODO: we can release vc only when both local and remote
      * procs have disconnected and all packets have been acked,
      * but what to do with received data not read by user? */
+#if 0
     if (vc->local_closed && vc->remote_closed) {
-        /* get id from vc */
-        uint64_t id = vc->readid;
-
-        /* clear this vc from our array */
-        g_ud_vc_info[id] = NULL;
+        SPAWN_ERR("Destroying VC");
 
         /* TODO: free off any memory allocated for vc */
 
@@ -876,65 +1078,49 @@ static void vc_free(vc_t* vc)
          * iterate over all items on send queue and remove them
          * from unack'd queue */
 
-        /* release vbufs on send window and remove from unack'd queue */
-        message_queue_t* sendwin = &vc->send_window;
-        vbuf* cur = sendwin->head;
-        while (cur != NULL) {
-            /* get pointer to next element in list */
-            vbuf* next = cur->sendwin_msg.next;
-    
-            /* remove packet from UD context unack'd queue */
-            unack_queue_remove(&proc.unack_queue, cur);
-    
-            /* release vbuf */
-            vbuf_release(cur);
+        /* delete any vbufs on UD extended send queue */
+//        vc_purge_ud_extsend(vc);
 
-            /* get next packet in send window */
-            cur = next;
+        /* delete any vbufs send and receive queues */
+//        vc_purge_queues(vc);
+
+        /* remove vc from connected queue if it's in there */
+        connected_list* prev = NULL;
+        connected_list* elem = connected_head;
+        while (elem != NULL) {
+            /* get pointer to vc */
+            vc_t* curr_vc = elem->vc;
+
+            /* check whether element matches target vc */
+            if (curr_vc == vc) {
+                /* found our vc on connected list, remove it */
+                if (connected_head == elem) {
+                    /* vc is at head of list, set new head */
+                    connected_head = elem->next;
+                } else {
+                    /* vc is in middle of list, update previous */
+                    prev->next = elem->next;
+                }
+
+                /* update tail if elem is current tail */
+                if (connected_tail == elem) {
+                    connected_tail = prev;
+                }
+
+                /* delete list item */
+                spawn_free(&elem);
+
+                /* no need to search anymore */
+                break;
+            }
+
+            /* go to next virtual channel */
+            prev = elem;
+            elem = elem->next;
         }
 
-        /* release vbufs from extended queue */
-        message_queue_t* extwin = &vc->ext_window;
-        cur = extwin->head;
-        while (cur != NULL) {
-            /* get pointer to next element in list */
-            vbuf* next = cur->extwin_msg.next;
-
-            /* release vbuf */
-            vbuf_release(cur);
-
-            /* go on to next item */
-            cur = next;
-        }
-
-        /* release vbufs from app receive queue */
-        message_queue_t* apprecvwin = &vc->app_recv_window;
-        cur = apprecvwin->head;
-        while (cur != NULL) {
-            /* get pointer to next element in list */
-            vbuf* next = cur->apprecvwin_msg.next;
-
-            /* release vbuf */
-            vbuf_release(cur);
-
-            /* go on to next item */
-            cur = next;
-        }
-
-        /* release vbufs from out-of-order receive queue */
-        message_queue_t* recvwin = &vc->recv_window;
-        cur = recvwin->head;
-        while (cur != NULL) {
-            /* get pointer to next element in list */
-            vbuf* next = cur->recvwin_msg.next;
-
-            /* release vbuf */
-            vbuf_release(cur);
-
-            /* go on to next item */
-            cur = next;
-        }
-
+        // can't delete this until all outstanding sends complete
+#if 0
         /* destroy address handle */
         if (vc->ah != NULL) {
             int ret = ibv_destroy_ah(vc->ah);
@@ -943,10 +1129,18 @@ static void vc_free(vc_t* vc)
             }
             vc->ah = NULL;
         }
+#endif
+
+        /* get id from vc */
+        uint64_t id = vc->readid;
+
+        /* clear this vc from our array */
+        g_ud_vc_info[id] = NULL;
 
         /* free vc object */
         spawn_free(&vc);
     }
+#endif
 
     return;
 }
@@ -962,7 +1156,7 @@ static int vc_free_all()
         vc_t* vc = g_ud_vc_info[i];
         if (vc != NULL) {
             /* to get here, both sides are closed */
-            vc->local_closed = 1;
+            vc->local_closed  = 1;
             vc->remote_closed = 1;
             vc_free(vc);
         }
@@ -1014,34 +1208,6 @@ static int vc_set_addr(vc_t* vc, ud_addr *rem_info, int port)
 /*******************************************
  * Communication routines
  ******************************************/
-
-/* this queue tracks a list of pending connect messages,
- * the accept function pulls items from this list */
-typedef struct connect_list_t {
-    vbuf* v;       /* pointer to vbuf for this message */
-    uint64_t epid; /* local endpoint id */
-    uint32_t lid;  /* requestor lid */
-    uint32_t qpn;  /* requestor queue pair number */
-    uint64_t id;   /* requestor write id to use when sending */
-    char* name;    /* requestor hostname */
-    struct connect_list_t* next; /* pointer to next item in list */
-} connect_list;
-
-static connect_list* connect_head = NULL;
-static connect_list* connect_tail = NULL;
-
-/* tracks list of accepted connection requests, which is used to
- * filter duplicate connection requests and track active channels */
-typedef struct connected_list_t {
-    unsigned int lid; /* remote LID */
-    unsigned int qpn; /* remote Queue Pair Number */
-    unsigned int id;  /* write id to use to send to remote side */
-    vc_t*  vc;        /* open vc to remote side */
-    struct connected_list_t* next; /* pointer to next item in list */
-} connected_list;
-
-static connected_list* connected_head = NULL;
-static connected_list* connected_tail = NULL;
 
 /* given a packet, virtual channel, and ud context, append packet
  * to extended send queue for UD context or send it out on wire */
@@ -1145,7 +1311,7 @@ static int ud_post_send(vc_t* vc, vbuf* v, ud_ctx_t* ud_ctx)
 
     /* TODO: should we set this when packet hits wire instead? */
     /* record time at which packet was submitted to UD context */
-    v->timestamp = spawn_clock_time_us();
+    v->timestamp = rdma_ud_last_check;
 
     /* add vbuf to the send window */
     send_window_add(&(vc->send_window), v);
@@ -1181,6 +1347,10 @@ static inline void ud_flush_ext_window(vc_t *vc)
          * check that this packet is at head of extended queue */
         extwin->head = next;
         extwin->count--;
+
+        /* clear extended send list pointers in vbuf */
+        cur->extwin_msg.prev = NULL;
+        cur->extwin_msg.next = NULL;
 
         /* track number of sends from extended send queue */
         vc->ext_win_send_count++;
@@ -1281,9 +1451,12 @@ static inline vbuf* apprecv_window_retrieve_and_remove(message_queue_t *q)
     if (q->head == NULL ) {
         q->tail = NULL;
         assert(q->count == 0);
+    } else {
+        q->head->apprecvwin_msg.prev = NULL;
     }
 
     /* clear next pointer in vbuf before return it */
+    v->apprecvwin_msg.prev = NULL;
     v->apprecvwin_msg.next = NULL;
 
     return v;
@@ -2147,7 +2320,9 @@ static inline void cq_drain()
 static void* timeout_thread_fn(void *arg)
 {
     /* define sleep time between waking and checking for events */
-    cm_timeout.tv_sec = rdma_ud_progress_timeout / 1000000;
+    struct timespec cm_timeout;
+    struct timespec cm_remain;
+    cm_timeout.tv_sec  = rdma_ud_progress_timeout / 1000000;
     cm_timeout.tv_nsec = (rdma_ud_progress_timeout - cm_timeout.tv_sec * 1000000) * 1000;
 
     /* we'll start a timer when we see the force_shutdown flag set,
@@ -2242,6 +2417,8 @@ static void* timeout_thread_fn(void *arg)
 
     comm_unlock();
 
+    pthread_exit(NULL);
+
     return NULL;
 }
 
@@ -2307,6 +2484,8 @@ static void* recv_thread_fn(void *arg)
 
     /* release the lock before we exit */
     comm_unlock();
+
+    pthread_exit(NULL);
 
     return NULL;
 }
