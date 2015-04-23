@@ -80,6 +80,8 @@ int main(int argc, char* argv[])
 
   free(chs);
 
+  MPI_Barrier(MPI_COMM_WORLD);
+
   spawn_net_close(&ep);
 
   MPI_Finalize();
