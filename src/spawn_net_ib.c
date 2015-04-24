@@ -984,7 +984,7 @@ static void vc_purge_queues(vc_t* vc)
     }
 
     /* any remaining items in VC send queue are vbufs that have
-     * actually been sent, so they could also be on the unack'd queue */
+     * actually been sent, so they will also be on the unack'd queue */
 
     /* release vbufs on send window and remove from unack'd queue */
     message_queue_t* sendwin = &vc->send_window;
@@ -1003,15 +1003,11 @@ static void vc_purge_queues(vc_t* vc)
         /* release vbuf */
         vbuf_release(cur);
 
-        /* clear pointer fields in vbuf */
-        cur->sendwin_msg.next = NULL;
-        cur->sendwin_msg.prev = NULL;
-
         /* get next packet in send window */
         cur = next;
     }
 
-    /* release vbufs from extended queue */
+    /* release vbufs from VC extended send queue */
     message_queue_t* extwin = &vc->ext_window;
     cur = extwin->head;
     while (cur != NULL) {
