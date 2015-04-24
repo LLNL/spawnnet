@@ -1182,24 +1182,6 @@ static void vc_free(vc_t** pvc)
     return;
 }
 
-/* called by main thread when destroying UD context to clean up
- * remaining active vcs, which may still exist because they
- * had messages on the unack'd queue when disconnected */
-static int vc_free_all()
-{
-    /* iterate over all possible vc's */
-    int i;
-    for (i = 0; i < g_ud_vc_info_id; i++) {
-        vc_t* vc = g_ud_vc_info[i];
-        if (vc != NULL) {
-            /* to get here, both sides are closed */
-            vc->local_closed  = 1;
-            vc->remote_closed = 1;
-            vc_free(&vc);
-        }
-    }
-}
-
 static int vc_set_addr(vc_t* vc, ud_addr *rem_info, int port)
 {
     /* don't bother to set anything if the state is already connecting
@@ -2552,7 +2534,7 @@ static void* recv_thread_fn(void *arg)
         cq_drain();
 
         /* if the shutdown signal is set, bail out */
-        if (g_shutdown && proc.ud_ctx->num_sends_posted == 0) {
+        if (g_shutdown) {
             break;
         }
     }
@@ -3189,13 +3171,9 @@ static void ud_ctx_destroy(spawn_net_endpoint** pep)
         } else {
             SPAWN_ERR("Failed to destroy receive condition variable (pthread_cond_destroy rc=%d %s)", rc, strerror(rc));
         }
-    } else {
-        /* we aren't using a receive thread, so main thread must wait
-         * for all outstanding sends to complete */
-        while (proc.ud_ctx->num_sends_posted > 0) {
-            cq_drain();
-        }
     }
+
+    /* at this point, we've killed the timeout and recv threads */
 
     /* destroy the lock */
     rc = pthread_mutex_destroy(&comm_lock_object);
@@ -3209,7 +3187,23 @@ static void ud_ctx_destroy(spawn_net_endpoint** pep)
      * unack'd messages when disconnect was called),
      * need to do this before vbuf_finalize because releasing vbufs
      * uses vbuf_lock which is destroyed in vbuf_finalize */
-    vc_free_all();
+    int i;
+    for (i = 0; i < g_ud_vc_info_id; i++) {
+        vc_t* vc = g_ud_vc_info[i];
+        if (vc != NULL) {
+            /* to get here, both sides are closed */
+            vc->local_closed  = 1;
+            vc->remote_closed = 1;
+            vc_free(&vc);
+        }
+    }
+
+    /* wait for all outstanding sends to complete,
+     * to free off any vcs with outstanding sends */
+    while (proc.ud_ctx->num_sends_posted > 0) {
+        cq_drain();
+    }
+
 
     /* deregister and free memory for vbufs */
     vbuf_finalize();
