@@ -930,11 +930,12 @@ static vc_t* vc_alloc()
     return vc;
 }
 
-/* delete any entries on UD contenxt extended send queue for VC,
- * and also delete from VC's send window, these messages have
- * been submitted to the UD context, but not yet sent */
-static void vc_purge_ud_extsend(vc_t* vc)
+static void vc_purge_queues(vc_t* vc)
 {
+    /* delete any entries on UD contenxt extended send queue for VC,
+     * and also delete from VC's send window, these messages have
+     * been submitted to the UD context, but not yet sent */
+
     /* get pointer to UD extended send queue */
     message_queue_t* q = &proc.ud_ctx->ext_send_queue;
 
@@ -982,25 +983,29 @@ static void vc_purge_ud_extsend(vc_t* vc)
         cur  = next;
     }
 
-    return;
-}
+    /* any remaining items in VC send queue are vbufs that have
+     * actually been sent, so they could also be on the unack'd queue */
 
-static void vc_purge_queues(vc_t* vc)
-{
     /* release vbufs on send window and remove from unack'd queue */
     message_queue_t* sendwin = &vc->send_window;
-    vbuf* cur = sendwin->head;
+    cur = sendwin->head;
     while (cur != NULL) {
         /* get pointer to next element in list */
         vbuf* next = cur->sendwin_msg.next;
    
-//        cur->sendwin_msg.next = cur->sendwin_msg.prev = NULL;
+        /* remove packet from VC send queue (enables VC to submit more
+         * packets to UD context */
+        send_window_remove(sendwin, cur);
 
         /* remove packet from UD context unack'd queue */
         unack_queue_remove(&proc.unack_queue, cur);
    
         /* release vbuf */
-//        vbuf_release(cur);
+        vbuf_release(cur);
+
+        /* clear pointer fields in vbuf */
+        cur->sendwin_msg.next = NULL;
+        cur->sendwin_msg.prev = NULL;
 
         /* get next packet in send window */
         cur = next;
@@ -1013,10 +1018,12 @@ static void vc_purge_queues(vc_t* vc)
         /* get pointer to next element in list */
         vbuf* next = cur->extwin_msg.next;
 
-//        cur->extwin_msg.next = cur->extwin_msg.prev = NULL;
-
         /* release vbuf */
-//        vbuf_release(cur);
+        vbuf_release(cur);
+
+        /* clear pointer fields in vbuf */
+        cur->extwin_msg.next = NULL;
+        cur->extwin_msg.prev = NULL;
 
         /* go on to next item */
         cur = next;
@@ -1061,15 +1068,55 @@ static void vc_purge_queues(vc_t* vc)
     return;
 }
 
+static void vc_purge_connected(vc_t* vc)
+{
+    /* remove vc from connected queue if it's in there */
+    connected_list* prev = NULL;
+    connected_list* elem = connected_head;
+    while (elem != NULL) {
+        /* get pointer to vc */
+        vc_t* curr_vc = elem->vc;
+
+        /* check whether element matches target vc */
+        if (curr_vc == vc) {
+            /* found our vc on connected list, remove it */
+            if (connected_head == elem) {
+                /* vc is at head of list, set new head */
+                connected_head = elem->next;
+            } else {
+                /* vc is in middle of list, update previous */
+                prev->next = elem->next;
+            }
+
+            /* update tail if elem is current tail */
+            if (connected_tail == elem) {
+                connected_tail = prev;
+            }
+
+            /* delete list item */
+            spawn_free(&elem);
+
+            /* no need to search anymore */
+            break;
+        }
+
+        /* go to next virtual channel */
+        prev = elem;
+        elem = elem->next;
+    }
+
+    return;
+}
+
 /* release vc back to pool if we can */
 static void vc_free(vc_t* vc)
 {
     /* TODO: we can release vc only when both local and remote
      * procs have disconnected and all packets have been acked,
      * but what to do with received data not read by user? */
-#if 0
     if (vc->local_closed && vc->remote_closed) {
-        SPAWN_ERR("Destroying VC");
+        //printf("Destroying VC\n");
+        //SPAWN_ERR("Destroying VC");
 
         /* TODO: free off any memory allocated for vc */
 
@@ -1078,48 +1125,18 @@ static void vc_free(vc_t* vc)
          * iterate over all items on send queue and remove them
          * from unack'd queue */
 
-        /* delete any vbufs on UD extended send queue */
-//        vc_purge_ud_extsend(vc);
-
         /* delete any vbufs send and receive queues */
-//        vc_purge_queues(vc);
+        vc_purge_queues(vc);
 
-        /* remove vc from connected queue if it's in there */
-        connected_list* prev = NULL;
-        connected_list* elem = connected_head;
-        while (elem != NULL) {
-            /* get pointer to vc */
-            vc_t* curr_vc = elem->vc;
+        /* remove vc from connected list */
+        vc_purge_connected(vc);
 
-            /* check whether element matches target vc */
-            if (curr_vc == vc) {
-                /* found our vc on connected list, remove it */
-                if (connected_head == elem) {
-                    /* vc is at head of list, set new head */
-                    connected_head = elem->next;
-                } else {
-                    /* vc is in middle of list, update previous */
-                    prev->next = elem->next;
-                }
+        /* can't delete addr handle until outstanding sends complete,
+         * we could add vc to a list of vcs to be deleted when
+         * a send completes but we'd need to count the number of
+         * sends_in_progress and decrement that count with each
+         * completed send to know when it's safe */
 
-                /* update tail if elem is current tail */
-                if (connected_tail == elem) {
-                    connected_tail = prev;
-                }
-
-                /* delete list item */
-                spawn_free(&elem);
-
-                /* no need to search anymore */
-                break;
-            }
-
-            /* go to next virtual channel */
-            prev = elem;
-            elem = elem->next;
-        }
-
-        // can't delete this until all outstanding sends complete
 #if 0
         /* destroy address handle */
         if (vc->ah != NULL) {
@@ -1140,7 +1157,6 @@ static void vc_free(vc_t* vc)
         /* free vc object */
         spawn_free(&vc);
     }
-#endif
 
     return;
 }
@@ -2179,6 +2195,8 @@ static int cq_poll(int* got_recv)
                 if (v->flags & UD_VBUF_SEND_INPROGRESS) {
                     v->flags &= ~(UD_VBUF_SEND_INPROGRESS);
 
+                    /* TODO: decrement outstanding sends counter for vc */
+
                     if (v->flags & UD_VBUF_FREE_PENIDING) {
                         v->flags &= ~(UD_VBUF_FREE_PENIDING);
 
@@ -2542,6 +2560,10 @@ static inline int packet_send(
  * returns a pointer to the packet */
 static vbuf* packet_wait(vc_t* vc)
 {
+    /* TODO: if there is no message in app_recv_window
+     * we may want to check whether remote side has closed
+     * connection to bail out with a connection closed error */
+
     /* if we don't have a receive thread,
      * eagerly pull all events from completion queue */
     if (g_recv_busy_spin) {
@@ -3532,6 +3554,10 @@ int spawn_net_read_ib(const spawn_net_channel* ch, void* buf, size_t size)
         return SPAWN_FAILURE;
     }
 
+    /* note that we could check whether remote end is still there and
+     * fail here if not, however, we still allow a read in case
+     * there is queued data we have yet to pull out of our buffers */
+
     comm_lock();
 
     /* compute header and payload sizes */
@@ -3592,6 +3618,11 @@ int spawn_net_write_ib(const spawn_net_channel* ch, const void* buf, size_t size
     /* get pointer to vc from channel data field */
     vc_t* vc = (vc_t*) ch->data;
     if (vc == NULL) {
+        return SPAWN_FAILURE;
+    }
+
+    /* check that remote end is still there */
+    if (vc->remote_closed) {
         return SPAWN_FAILURE;
     }
 
