@@ -76,6 +76,8 @@ int main(int argc, char* argv[])
   
       spawn_net_disconnect(&ch);
     }
+
+    MPI_Barrier(MPI_COMM_WORLD);
   }
 
   free(chs);
