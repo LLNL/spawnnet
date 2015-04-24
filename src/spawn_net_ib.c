@@ -985,10 +985,7 @@ static void vc_purge_queues(vc_t* vc)
     }
 
     /* any remaining items in VC send queue are vbufs that have
-     * actually been sent, so they will also be on the unack'd queue,
-     * if a send is still in progress, we increment a counter which
-     * we'll later decrement when the send completes to know when it's
-     * safe to destroy the address handle */
+     * actually been sent, so they will also be on the unack'd queue */
 
     /* release vbufs on send window and remove from unack'd queue */
     message_queue_t* sendwin = &vc->send_window;
@@ -1284,6 +1281,9 @@ static inline void ibv_ud_post_sr(
 
         /* increment number of sends outstanding for this vc */
         vc->sends_outstanding++;
+
+        /* increment global number of sends posted */
+        ud_ctx->num_sends_posted++;
 
         /* one less send WQE available now */
         ud_ctx->send_wqes_avail--;
@@ -1751,6 +1751,9 @@ static void ud_resend(vbuf *v)
         /* increment number of sends outstanding for this vc */
         vc->sends_outstanding++;
 
+        /* increment global number of sends posted */
+        ud_ctx->num_sends_posted++;
+
         /* decrement number of send work queue elements */
         ud_ctx->send_wqes_avail--;
 
@@ -2160,6 +2163,9 @@ static void ud_update_send_credits(int num)
         vc_t* vc = cur->vc;
         vc->sends_outstanding++;
 
+        /* increment global number of sends posted */
+        ud_ctx->num_sends_posted++;
+
         /* decrement number of send work queue elements available */
         ud_ctx->send_wqes_avail--;
 
@@ -2227,6 +2233,9 @@ static int cq_poll(int* got_recv)
             case IBV_WC_SEND:
                 /* remember that a send completed to issue more sends later */
                 sendcnt++;
+
+                /* decrement global number of sends posted */
+                proc.ud_ctx->num_sends_posted--;
 
                 /* get vc for send */
                 vc_t* vc = v->vc;
@@ -3022,6 +3031,7 @@ static ud_ctx_t* ud_ctx_create()
     ud_ctx->qp               = NULL;
     ud_ctx->hca_num          = 0;
     ud_ctx->send_wqes_avail  = rdma_default_max_ud_send_wqe - 50;
+    ud_ctx->num_sends_posted = 0;
     ud_ctx->num_recvs_posted = 0;
     ud_ctx->credit_preserve  = (rdma_default_max_ud_recv_wqe / 4);
     MESSAGE_QUEUE_INIT(&ud_ctx->ext_send_queue);
@@ -3139,13 +3149,24 @@ static void ud_ctx_destroy(spawn_net_endpoint** pep)
         SPAWN_ERR("Failed to join resend timeout event thread (pthread_join rc=%d %s)", rc, strerror(rc));
     }
 
+    /* TODO: wait for all outstanding sends to complete via condition variable
+     * to be set by recv thread once num_sends_posted hits 0 */
+    //  comm_lock();
+    // if (ud_ctx->num_sends_posted > 0)
+    //   pthread_cond_wait(&g_recv_cond, &comm_lock_object);
+
     /* shut down receive thread if we have one */
     if (! g_recv_busy_spin) {
-        /* TODO: send a shutdown message to force the recv_thread
-         * to get an event and thus wake up, then call pthread_join
-         * here instead */
+        /* it's not safe to just kill the recv thread at any point,
+         * because it may be in between calls to ibv_get_cq_event
+         * and ibv_ack_cq_events, so we send a message to kill it */
+
+        comm_lock();
+
         /* send a message to ourself to shutdown recv thread */
         packet_send(g_vc_self, PKT_UD_SHUTDOWN, NULL, 0);
+
+        comm_unlock();
 
 #if 0
         /* shut down the receive thread */

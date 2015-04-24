@@ -353,6 +353,7 @@ typedef struct ud_ctx_struct {
     struct ibv_qp* qp;        /* UD QP */
     int hca_num;              /* id of HCA to use, starts at 0 */
     int send_wqes_avail;      /* number of available send work queue elements for UD QP */
+    int num_sends_posted;     /* number of send elements currently posted */
     int num_recvs_posted;     /* number of receive elements currently posted */
     int credit_preserve;      /* low-water mark for number of posted receives */
     message_queue_t ext_send_queue; /* UD extended send queue */
