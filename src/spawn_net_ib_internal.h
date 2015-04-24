@@ -235,9 +235,8 @@ struct ibv_wr_descriptor
     void* next;
 };
 
-#define UD_VBUF_FREE_PENIDING       (0x01)
-#define UD_VBUF_SEND_INPROGRESS     (0x02)
-#define UD_VBUF_RETRY_ALWAYS        (0x04)
+#define UD_VBUF_FREE_PENDING    (0x01)
+#define UD_VBUF_SEND_INPROGRESS (0x02)
 
 /* ibverbs reserves the first 40 bytes of each UD packet, this may
  * sometimes contain valid data for a Global Routine Header */
@@ -332,6 +331,7 @@ typedef struct packet_header_struct {
 #define VC_STATE_INIT       (0x0040)
 #define VC_STATE_CONNECTING (0x0001)
 #define VC_STATE_CONNECTED  (0x0002)
+#define VC_STATE_CLOSING    (0x0004)
 
 /* tracks a list of vbufs */
 typedef struct message_queue_t {
@@ -382,6 +382,7 @@ typedef struct vc_struct
     uint16_t state;               /* state of VC */
     int local_closed;             /* track whether local side has disconnected */
     int remote_closed;            /* track whether remote has disconnected */
+    int sends_outstanding;        /* track number of sends currently on the wire for this vc */
 
     /* remote address info */
     struct ibv_ah *ah;            /* IB address of remote process */

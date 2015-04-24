@@ -758,7 +758,7 @@ static void vbuf_release(vbuf* v)
         /* TODO: when is this really added back to the free buffer? */
 
         /* mark vbuf that it's ready to be freed */
-        v->flags |= UD_VBUF_FREE_PENIDING;
+        v->flags |= UD_VBUF_FREE_PENDING;
         return;
     }
 
@@ -845,6 +845,7 @@ static void vc_init(vc_t* vc)
     vc->state = VC_STATE_INIT;
     vc->local_closed  = 0;
     vc->remote_closed = 0;
+    vc->sends_outstanding = 0;
 
     /* init remote address info */
     vc->ah  = NULL;
@@ -984,7 +985,10 @@ static void vc_purge_queues(vc_t* vc)
     }
 
     /* any remaining items in VC send queue are vbufs that have
-     * actually been sent, so they will also be on the unack'd queue */
+     * actually been sent, so they will also be on the unack'd queue,
+     * if a send is still in progress, we increment a counter which
+     * we'll later decrement when the send completes to know when it's
+     * safe to destroy the address handle */
 
     /* release vbufs on send window and remove from unack'd queue */
     message_queue_t* sendwin = &vc->send_window;
@@ -1104,54 +1108,78 @@ static void vc_purge_connected(vc_t* vc)
     return;
 }
 
-/* release vc back to pool if we can */
-static void vc_free(vc_t* vc)
+/* frees address handle and memory associated with vc structure */
+static void vc_delete(vc_t** pvc)
 {
+    /* check that we got an address */
+    if (pvc == NULL) {
+        return;
+    }
+
+    /* get pointer to vc */
+    vc_t* vc = *pvc;
+
+    /* check that we going a valid pointer */
+    if (vc == NULL) {
+        return;
+    }
+
+    /* destroy address handle */
+    if (vc->ah != NULL) {
+        int ret = ibv_destroy_ah(vc->ah);
+        if (ret != 0) {
+            SPAWN_ERR("Error in destroying address handle (ibv_destroy_ah rc=%d %s)", ret, strerror(ret));
+        }
+        vc->ah = NULL;
+    }
+
+    /* get id from vc */
+    uint64_t id = vc->readid;
+
+    /* clear this vc from our array */
+    g_ud_vc_info[id] = NULL;
+
+    /* free vc object */
+    spawn_free(pvc);
+
+    return;
+}
+
+/* release vc back to pool if we can */
+static void vc_free(vc_t** pvc)
+{
+    /* check that we got an address */
+    if (pvc == NULL) {
+        return;
+    }
+
+    /* get pointer to vc */
+    vc_t* vc = *pvc;
+
+    /* check that we going a valid pointer */
+    if (vc == NULL) {
+        return;
+    }
+
     /* TODO: we can release vc only when both local and remote
-     * procs have disconnected and all packets have been acked,
-     * but what to do with received data not read by user? */
+     * procs have disconnected */
     if (vc->local_closed && vc->remote_closed) {
-        //printf("Destroying VC\n");
-        //SPAWN_ERR("Destroying VC");
+        /* mark state to closing */
+        vc->state = VC_STATE_CLOSING;
 
-        /* TODO: free off any memory allocated for vc */
-
-        /* delete any messages this vc has on unack'd queue,
-         * any items on unack'd queue will be on vc send queue
-         * iterate over all items on send queue and remove them
-         * from unack'd queue */
-
-        /* delete any vbufs send and receive queues */
+        /* delete any vbufs on send, receive, and unack queues */
         vc_purge_queues(vc);
 
         /* remove vc from connected list */
         vc_purge_connected(vc);
 
-        /* can't delete addr handle until outstanding sends complete,
-         * we could add vc to a list of vcs to be deleted when
-         * a send completes but we'd need to count the number of
-         * sends_in_progress and decrement that count with each
-         * completed send to know when it's safe */
-
-#if 0
-        /* destroy address handle */
-        if (vc->ah != NULL) {
-            int ret = ibv_destroy_ah(vc->ah);
-            if (ret != 0) {
-                SPAWN_ERR("Error in destroying address handle (ibv_destroy_ah rc=%d %s)", ret, strerror(ret));
-            }
-            vc->ah = NULL;
+        /* we need to destroy the address handle, but we can't do this
+         * if the vc has outstanding sends currently using that handle,
+         * so delete now if we can, otherwise, we'll delete the VC
+         * when we process its last send completion event */
+        if (vc->sends_outstanding == 0) {
+            vc_delete(pvc);
         }
-#endif
-
-        /* get id from vc */
-        uint64_t id = vc->readid;
-
-        /* clear this vc from our array */
-        g_ud_vc_info[id] = NULL;
-
-        /* free vc object */
-        spawn_free(&vc);
     }
 
     return;
@@ -1170,7 +1198,7 @@ static int vc_free_all()
             /* to get here, both sides are closed */
             vc->local_closed  = 1;
             vc->remote_closed = 1;
-            vc_free(vc);
+            vc_free(&vc);
         }
     }
 }
@@ -1180,7 +1208,8 @@ static int vc_set_addr(vc_t* vc, ud_addr *rem_info, int port)
     /* don't bother to set anything if the state is already connecting
      * or connected */
     if (vc->state == VC_STATE_CONNECTING ||
-        vc->state == VC_STATE_CONNECTED)
+        vc->state == VC_STATE_CONNECTED  ||
+        vc->state == VC_STATE_CLOSING)
     {
         /* duplicate message - return */
         return 0;
@@ -1238,7 +1267,7 @@ static inline void ibv_ud_post_sr(
         sr->send_flags = IBV_SEND_SIGNALED;
     }
 
-    /* specify iB address handle and remote queue pair number */
+    /* specify IB address handle and remote queue pair number */
     sr->wr.ud.ah = vc->ah;
     sr->wr.ud.remote_qpn = vc->qpn;
 
@@ -1252,6 +1281,9 @@ static inline void ibv_ud_post_sr(
     } else {
         /* we have a WQE and the extended send queue is clear,
          * send the packet on the wire */
+
+        /* increment number of sends outstanding for this vc */
+        vc->sends_outstanding++;
 
         /* one less send WQE available now */
         ud_ctx->send_wqes_avail--;
@@ -1663,9 +1695,7 @@ static void ud_resend(vbuf *v)
 {
     /* if vbuf is marked as send-in-progress, don't send again,
      * unless "always retry" flag is set */
-    if (v->flags & UD_VBUF_SEND_INPROGRESS && 
-        ! (v->flags & UD_VBUF_RETRY_ALWAYS))
-    {
+    if (v->flags & UD_VBUF_SEND_INPROGRESS) {
         return;
     }
 
@@ -1718,8 +1748,13 @@ static void ud_resend(vbuf *v)
 
     /* send vbuf (or add to extended UD send queue if we don't have credits) */
     if (ud_ctx->send_wqes_avail > 0) {
-//SPAWN_ERR("resending payload of size %d at %p\n", v->content_size, v);
+        /* increment number of sends outstanding for this vc */
+        vc->sends_outstanding++;
+
+        /* decrement number of send work queue elements */
         ud_ctx->send_wqes_avail--;
+
+        /* send the packet */
         int ret = ibv_post_send(ud_ctx->qp, &(v->desc.u.sr), &(v->desc.y.bad_sr));
         if (ret != 0) {
             SPAWN_ERR("reliability resend failed (ibv_post_send rc=%d %s)", ret, strerror(ret));
@@ -1817,7 +1852,7 @@ static void ud_process_recv(vbuf *v)
             g_count_conn--;
 
             /* free the VC if we can */
-            vc_free(vc);
+            vc_free(&vc);
 
             goto fn_exit;
         }
@@ -2120,8 +2155,15 @@ static void ud_update_send_credits(int num)
         cur->desc.next = NULL;
 
         /* TODO: can we reset ack to latest? */
-        /* send item */
+
+        /* increment number of sends outstanding for this vc */
+        vc_t* vc = cur->vc;
+        vc->sends_outstanding++;
+
+        /* decrement number of send work queue elements available */
         ud_ctx->send_wqes_avail--;
+
+        /* send item */
         int ret = ibv_post_send(ud_ctx->qp, &(cur->desc.u.sr), &(cur->desc.y.bad_sr));
         if (ret != 0) {
             SPAWN_ERR("extend sendq send failed (ibv_post_send rc=%d %s)", ret, strerror(ret));
@@ -2186,15 +2228,25 @@ static int cq_poll(int* got_recv)
                 /* remember that a send completed to issue more sends later */
                 sendcnt++;
 
+                /* get vc for send */
+                vc_t* vc = v->vc;
+
+                /* decrement number of active sends on this vc */
+                vc->sends_outstanding--;
+
+                /* free vc if it's closing and all outstanding
+                 * sends have completed */
+                if (vc->state == VC_STATE_CLOSING && vc->sends_outstanding == 0) {
+                    vc_delete(&vc);
+                }
+
                 /* if SEND_INPROGRESS and FREE_PENDING flags are set,
                  * release the vbuf */
                 if (v->flags & UD_VBUF_SEND_INPROGRESS) {
                     v->flags &= ~(UD_VBUF_SEND_INPROGRESS);
 
-                    /* TODO: decrement outstanding sends counter for vc */
-
-                    if (v->flags & UD_VBUF_FREE_PENIDING) {
-                        v->flags &= ~(UD_VBUF_FREE_PENIDING);
+                    if (v->flags & UD_VBUF_FREE_PENDING) {
+                        v->flags &= ~(UD_VBUF_FREE_PENDING);
 
                         vbuf_release(v);
                     }
@@ -3112,7 +3164,7 @@ static void ud_ctx_destroy(spawn_net_endpoint** pep)
         /* after recv thread finishes, free the VC to ourself */
         g_vc_self->local_closed  = 1;
         g_vc_self->remote_closed = 1;
-        vc_free(g_vc_self);
+        vc_free(&g_vc_self);
         g_vc_self = NULL;
 
         /* delete the condition variable */
@@ -3526,7 +3578,7 @@ int spawn_net_disconnect_ib(spawn_net_channel** pch)
     g_count_conn--;
 
     /* release vc if we can */
-    vc_free(vc);
+    vc_free(&vc);
 
     comm_unlock();
 
