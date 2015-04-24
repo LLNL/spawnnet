@@ -2552,7 +2552,7 @@ static void* recv_thread_fn(void *arg)
         cq_drain();
 
         /* if the shutdown signal is set, bail out */
-        if (g_shutdown) {
+        if (g_shutdown && proc.ud_ctx->num_sends_posted == 0) {
             break;
         }
     }
@@ -3149,12 +3149,6 @@ static void ud_ctx_destroy(spawn_net_endpoint** pep)
         SPAWN_ERR("Failed to join resend timeout event thread (pthread_join rc=%d %s)", rc, strerror(rc));
     }
 
-    /* TODO: wait for all outstanding sends to complete via condition variable
-     * to be set by recv thread once num_sends_posted hits 0 */
-    //  comm_lock();
-    // if (ud_ctx->num_sends_posted > 0)
-    //   pthread_cond_wait(&g_recv_cond, &comm_lock_object);
-
     /* shut down receive thread if we have one */
     if (! g_recv_busy_spin) {
         /* it's not safe to just kill the recv thread at any point,
@@ -3194,6 +3188,12 @@ static void ud_ctx_destroy(spawn_net_endpoint** pep)
             //g_recv_cond = PTHREAD_COND_INITIALIZER;
         } else {
             SPAWN_ERR("Failed to destroy receive condition variable (pthread_cond_destroy rc=%d %s)", rc, strerror(rc));
+        }
+    } else {
+        /* we aren't using a receive thread, so main thread must wait
+         * for all outstanding sends to complete */
+        while (proc.ud_ctx->num_sends_posted > 0) {
+            cq_drain();
         }
     }
 
