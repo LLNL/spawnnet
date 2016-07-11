@@ -141,7 +141,7 @@ static char* spawn_net_get_remote_sockname(int fd, const char* host)
 static int spawn_net_set_tcp_nodelay(int fd)
 {
   /* read no delay setting from environment if set */
-  int set_nodelay = 0;
+  int set_nodelay = 1;
   char *env;
   if ((env = getenv("SPAWN_TCP_NODELAY")) != NULL ) {
     set_nodelay = atoi(env);
