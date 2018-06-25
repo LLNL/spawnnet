@@ -1,3 +1,4 @@
+# Spawnnet overview
 SpawnNet provides three related packages for fast network communication,
 targeted for communication between MPI processes and the process
 launcher as well as between MPI processes.
@@ -18,6 +19,8 @@ along with a few collectives and fast group splitting operations.
 
 To include headers for all packages, include "spawn.h".
 
+To get started, see the [examples README](examples/README.md).
+
 See the following headers for more details:
   spawn_net.h
   strmap.h
@@ -27,9 +30,11 @@ See the following headers for more details:
 
 To buid with IBUD support:
 
+````
 ./configure \
   --prefix=$installdir \
   LDFLAGS="-libverbs" \
   --disable-silent-rules
 make
 make install
+````
