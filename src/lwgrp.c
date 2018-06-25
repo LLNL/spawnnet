@@ -811,8 +811,8 @@ static lwgrp* lwgrp_split_sorted_blocking(
     }
   }
 
-  /* if we have a left neighbor, and if his color value matches ours,
-   * then our element is part of his group, otherwise we are the first
+  /* if we have a left neighbor, and if its color value matches ours,
+   * then our element is part of its group, otherwise we are the first
    * rank of a new group */
   int first_in_group = 1;
   if (rank > 0) {
@@ -830,8 +830,8 @@ static lwgrp* lwgrp_split_sorted_blocking(
     }
   }
 
-  /* if we have a right neighbor, and if his color value matches ours,
-   * then our element is part of his group, otherwise we are the last
+  /* if we have a right neighbor, and if its color value matches ours,
+   * then our element is part of its group, otherwise we are the last
    * rank of our group */
   int last_in_group = 1;
   if (rank < ranks - 1) {
@@ -1034,8 +1034,8 @@ static lwgrp* lwgrp_split_sorted(
     spawn_net_read(right, right_buf, size);
   }
 
-  /* if we have a left neighbor, and if his color value matches ours,
-   * then our element is part of his group, otherwise we are the first
+  /* if we have a left neighbor, and if its color value matches ours,
+   * then our element is part of its group, otherwise we are the first
    * rank of a new group */
   int first_in_group = 1;
   if (rank > 0) {
@@ -1053,8 +1053,8 @@ static lwgrp* lwgrp_split_sorted(
     }
   }
 
-  /* if we have a right neighbor, and if his color value matches ours,
-   * then our element is part of his group, otherwise we are the last
+  /* if we have a right neighbor, and if its color value matches ours,
+   * then our element is part of its group, otherwise we are the last
    * rank of our group */
   int last_in_group = 1;
   if (rank < ranks - 1) {
