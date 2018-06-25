@@ -1529,137 +1529,44 @@ int lwgrp_barrier(const lwgrp* group)
 
 int lwgrp_allreduce_uint64_sum_blocking(uint64_t* buf, uint64_t count, const lwgrp* group)
 {
-  int64_t rank  = group->rank;
-  int64_t ranks = group->size;
-
   size_t buf_size = count * sizeof(uint64_t);
   uint64_t* left_buf  = SPAWN_MALLOC(buf_size);
   uint64_t* right_buf = SPAWN_MALLOC(buf_size);
 
+  int rc = lwgrp_double_scan_uint64_sum_blocking(buf, left_buf, right_buf, count, group);
+
+  /* set output buffer to be sum of left and right values,
+   * minus our input buffer to avoid double counting */
   int i;
-  int round = 0;
-  int64_t dist = 1;
-  while (dist < ranks) {
-    /* compute our relative rank for this round */
-    int64_t relrank  = (rank >> round);
-
-    if (relrank & 0x1) {
-      /* we're odd in this round */
-
-      /* exchange data with left partner */
-      if (rank - dist >= 0) {
-        /* recv then send */
-        spawn_net_channel* ch = group->list_left[round];
-        spawn_net_read(ch, left_buf, buf_size);
-        spawn_net_write(ch, buf, buf_size);
-      }
-
-      /* exchange data with right partner */
-      if (rank + dist < ranks) {
-        /* send then recv */
-        spawn_net_channel* ch = group->list_right[round];
-        spawn_net_write(ch, buf, buf_size);
-        spawn_net_read(ch, right_buf, buf_size);
-      }
-    } else {
-      /* we're even in this round */
-
-      /* exchange data with right partner */
-      if (rank + dist < ranks) {
-        /* send then recv */
-        spawn_net_channel* ch = group->list_right[round];
-        spawn_net_write(ch, buf, buf_size);
-        spawn_net_read(ch, right_buf, buf_size);
-      }
-
-      /* exchange data with left partner */
-      if (rank - dist >= 0) {
-        /* recv then send */
-        spawn_net_channel* ch = group->list_left[round];
-        spawn_net_read(ch, left_buf, buf_size);
-        spawn_net_write(ch, buf, buf_size);
-      }
-    }
-
-    /* merge received maps with our current map */
-    if (rank - dist >= 0) {
-      for (i = 0; i < count; i++) {
-        buf[i] += left_buf[i];
-      }
-    }
-    if (rank + dist < ranks) {
-      for (i = 0; i < count; i++) {
-        buf[i] += right_buf[i];
-      }
-    }
-
-    dist <<= 1;
-    round++;
+  for (i = 0; i < count; i++) {
+    buf[i] = left_buf[i] + right_buf[i] - buf[i];
   }
 
   spawn_free(&right_buf);
   spawn_free(&left_buf);
 
-  return LWGRP_SUCCESS;
+  return rc;
 }
 
 int lwgrp_allreduce_uint64_sum(uint64_t* buf, uint64_t count, const lwgrp* group)
 {
-  int64_t rank  = group->rank;
-  int64_t ranks = group->size;
-
   size_t buf_size = count * sizeof(uint64_t);
   uint64_t* left_buf  = SPAWN_MALLOC(buf_size);
   uint64_t* right_buf = SPAWN_MALLOC(buf_size);
 
+  int rc = lwgrp_double_scan_uint64_sum(buf, left_buf, right_buf, count, group);
+
+  /* set output buffer to be sum of left and right values,
+   * minus our input buffer to avoid double counting */
   int i;
-  int round = 0;
-  int64_t dist = 1;
-  while (dist < ranks) {
-    /* send message left */
-    if (rank - dist >= 0) {
-      spawn_net_channel* ch = group->list_left[round];
-      spawn_net_write(ch, buf, buf_size);
-    }
-
-    /* send message right */
-    if (rank + dist < ranks) {
-      spawn_net_channel* ch = group->list_right[round];
-      spawn_net_write(ch, buf, buf_size);
-    }
-
-    /* recv message from left */
-    if (rank - dist >= 0) {
-      spawn_net_channel* ch = group->list_left[round];
-      spawn_net_read(ch, left_buf, buf_size);
-    }
-
-    /* recv message from right */
-    if (rank + dist < ranks) {
-      spawn_net_channel* ch = group->list_right[round];
-      spawn_net_read(ch, right_buf, buf_size);
-    }
-
-    /* merge received maps with our current map */
-    if (rank - dist >= 0) {
-      for (i = 0; i < count; i++) {
-        buf[i] += left_buf[i];
-      }
-    }
-    if (rank + dist < ranks) {
-      for (i = 0; i < count; i++) {
-        buf[i] += right_buf[i];
-      }
-    }
-
-    dist <<= 1;
-    round++;
+  for (i = 0; i < count; i++) {
+    buf[i] = left_buf[i] + right_buf[i] - buf[i];
   }
 
   spawn_free(&right_buf);
   spawn_free(&left_buf);
 
-  return LWGRP_SUCCESS;
+  return rc;
 }
 
 int lwgrp_allreduce_uint64_max_blocking(uint64_t* buf, uint64_t count, const lwgrp* group)
