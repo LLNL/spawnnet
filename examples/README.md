@@ -8,6 +8,13 @@ If not available, PMI2 Put/Fence/Get is used as a fallback.
 
 Edit [Makefile](Makefile) to build.
 
+Then to build and run:
+
+````
+make
+srun -n2 -N2 --mpi=pmi2 ./allreduce
+````
+
 ## Two-level communicators
 In some cases, it is useful to create multiple process groups during MPI startup.
 For example, it is common to need a world group of all processes,
