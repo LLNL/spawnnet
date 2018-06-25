@@ -55,12 +55,16 @@ void ring(int rank, int size, const char* val, int* ring_rank, int* ring_size, c
 #endif
 }
 
+typedef struct lwgrp_comm_t {
+  lwgrp* world;
+  lwgrp* node;
+  lwgrp* leaders;
+} lwgrp_comm;
+
 /* executes an allgather of address values */
-void allgather(int rank, int size, int len, char* addr, char* buf)
+void comm_create(int rank, int size, spawn_net_endpoint* ep, lwgrp_comm* comm)
 {
-    /* open and endpoint and get its name */
-    //spawn_net_endpoint* ep = spawn_net_open(SPAWN_NET_TYPE_IBUD);
-    spawn_net_endpoint* ep = spawn_net_open(SPAWN_NET_TYPE_TCP);
+    /* get name of our endpoint */
     const char* ep_name = spawn_net_name(ep);
 
     /* exchange endpoint address on ring */
@@ -72,29 +76,46 @@ void allgather(int rank, int size, int len, char* addr, char* buf)
     ring(rank, size, val, &ring_rank, &ring_size, left, right, 128);
 
     /* create global comm, using left and right endpoints */
-    lwgrp* comm_world = lwgrp_create(ring_size, ring_rank, ep_name, left, right, ep);
+    comm->world = lwgrp_create(ring_size, ring_rank, ep_name, left, right, ep);
 
     /* get comm of procs on same node */
     char hostname[128];
     gethostname(hostname, sizeof(hostname));
-    lwgrp* comm_intra = lwgrp_split_str(comm_world, hostname);
+    comm->node = lwgrp_split_str(comm->world, hostname);
 
     /* get comm of leaders (procs having same rank in node communicator) */
-    int rank_world = lwgrp_rank(comm_world);
-    int rank_intra = lwgrp_rank(comm_intra);
-    lwgrp* comm_inter = lwgrp_split(comm_world, rank_intra, rank_world);
+    int rank_world = lwgrp_rank(comm->world);
+    int rank_intra = lwgrp_rank(comm->node);
+    comm->leaders = lwgrp_split(comm->world, rank_intra, rank_world);
 
+    return;
+}
+
+void comm_free(lwgrp_comm* comm)
+{
+    /* free communicators */
+    lwgrp_free(&comm->leaders);
+    lwgrp_free(&comm->node);
+    lwgrp_free(&comm->world);
+
+    return;
+}
+
+/* executes an allgather of address values */
+void allgather(int rank, int size, int len, char* addr, char* buf, lwgrp_comm* comm)
+{
     /* create a map and insert our address */
     strmap* map = strmap_new();
     strmap_setf(map, "%d=%s", rank, addr);
 
     /* allgather strmap, 
      * gather to leader, allgatherv across leaders, bcast from leader */
-    lwgrp_allgather_strmap(map, comm_intra);
-    if (rank_intra == 0) {
-        lwgrp_allgather_strmap(map, comm_inter);
+    lwgrp_allgather_strmap(map, comm->node);
+    uint64_t rank_node = lwgrp_rank(comm->node);
+    if (rank_node == 0) {
+        lwgrp_allgather_strmap(map, comm->leaders);
     }
-    lwgrp_allgather_strmap(map, comm_intra);
+    lwgrp_allgather_strmap(map, comm->node);
 
     /* extract MPI address for each process and copy to buffer */
     int source_rank;
@@ -111,14 +132,6 @@ void allgather(int rank, int size, int len, char* addr, char* buf)
     /* free the map */
     strmap_delete(&map);
 
-    /* free communicators */
-    lwgrp_free(&comm_inter);
-    lwgrp_free(&comm_intra);
-    lwgrp_free(&comm_world);
-
-    /* close our endpoint and channel */
-    spawn_net_close(&ep);
-
     return;
 }
 
@@ -128,6 +141,14 @@ int main(int argc, char **argv)
     int spawned, size, rank, appnum;
     PMI2_Init(&spawned, &size, &rank, &appnum);
 
+    /* open and endpoint and get its name */
+    //spawn_net_endpoint* ep = spawn_net_open(SPAWN_NET_TYPE_IBUD);
+    spawn_net_endpoint* ep = spawn_net_open(SPAWN_NET_TYPE_TCP);
+
+    /* allocate communicator */
+    lwgrp_comm comm;
+    comm_create(rank, size, ep, &comm);
+
     /* encode address into same length string on all procs */
     char addr[128];
     sprintf(addr, "rank%10d", rank);
@@ -135,8 +156,14 @@ int main(int argc, char **argv)
 
     /* allocate memory region on each process and fill it with address values */
     char* addrs = (char*) malloc(size * len);
-    allgather(rank, size, len, addr, addrs);
+    allgather(rank, size, len, addr, addrs, &comm);
     free(addrs);
+
+    /* free communicator */
+    comm_free(&comm);
+
+    /* close our endpoint and channel */
+    spawn_net_close(&ep);
 
     /* shut down PMI */
     PMI2_Finalize();
