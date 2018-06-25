@@ -1,0 +1,22 @@
+#!/bin/bash
+
+set -x
+
+export PATH=`pwd`/autotools/install/bin:$PATH
+
+export CFLAGS="-g -O3"
+
+installdir=`pwd`/install
+
+autoreconf --install --force
+
+make distclean
+
+./configure \
+  --prefix=$installdir \
+  LDFLAGS="-libverbs" \
+  --disable-silent-rules
+
+make clean
+
+make distcheck
