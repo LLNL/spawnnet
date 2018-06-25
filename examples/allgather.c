@@ -1,9 +1,7 @@
 #include <stdio.h>
-#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <slurm/pmi2.h>
-#include <sys/time.h>
 
 #include "spawn.h"
 
@@ -60,10 +58,6 @@ void ring(int rank, int size, const char* val, int* ring_rank, int* ring_size, c
 /* executes an allgather of address values */
 void allgather(int rank, int size, int len, char* addr, char* buf)
 {
-    /* start timer */
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-
     /* open and endpoint and get its name */
     //spawn_net_endpoint* ep = spawn_net_open(SPAWN_NET_TYPE_IBUD);
     spawn_net_endpoint* ep = spawn_net_open(SPAWN_NET_TYPE_TCP);
@@ -125,15 +119,6 @@ void allgather(int rank, int size, int len, char* addr, char* buf)
     /* close our endpoint and channel */
     spawn_net_close(&ep);
 
-    /* stop timer and report cost */
-    struct timeval tv2;
-    gettimeofday(&tv2, NULL);
-    if (rank == 0) {
-        printf("%f ms\n",
-               ((tv2.tv_sec - tv.tv_sec) * 1000.0
-                + (tv2.tv_usec - tv.tv_usec) / 1000.0));
-    }
-
     return;
 }
 
@@ -142,13 +127,6 @@ int main(int argc, char **argv)
     /* initialize PMI, get our rank and process group size */
     int spawned, size, rank, appnum;
     PMI2_Init(&spawned, &size, &rank, &appnum);
-
-    /* ensure all procs have complete init before starting timer */
-    PMI2_KVS_Fence();
-
-    /* start timer */
-    struct timeval tv, tv2;
-    gettimeofday(&tv, NULL);
 
     /* encode address into same length string on all procs */
     char addr[128];
@@ -159,17 +137,6 @@ int main(int argc, char **argv)
     char* addrs = (char*) malloc(size * len);
     allgather(rank, size, len, addr, addrs);
     free(addrs);
-
-    /* ensure all procs have finished before stopping timer */
-    PMI2_KVS_Fence();
-
-    /* stop timer and report cost */
-    gettimeofday(&tv2, NULL);
-    if (rank == 0) {
-        printf("%f ms\n",
-               ((tv2.tv_sec - tv.tv_sec) * 1000.0
-                + (tv2.tv_usec - tv.tv_usec) / 1000.0));
-    }
 
     /* shut down PMI */
     PMI2_Finalize();
