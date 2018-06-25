@@ -6,7 +6,7 @@ The examples use PMIX_Ring if available.
 PMIX_Ring is provided in MVAPICH2 and the SLURM pmi2 plugin.
 If not available, PMI2 Put/Fence/Get is used as a fallback.
 
-Edit [Makefile](Makefile} to build.
+Edit [Makefile](Makefile) to build.
 
 ## Two-level communicators
 In some cases, it is useful to create multiple process groups during MPI startup.
