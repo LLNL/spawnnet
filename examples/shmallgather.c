@@ -119,7 +119,7 @@ typedef struct lwgrp_comm_t {
   lwgrp* leaders;
 } lwgrp_comm;
 
-/* executes an allgather of address values */
+/* create world, node, and leader groups and store in comm struct */
 void comm_create(int rank, int size, spawn_net_endpoint* ep, lwgrp_comm* comm)
 {
     /* get name of our endpoint */
