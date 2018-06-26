@@ -69,9 +69,7 @@ void comm_create(int rank, int size, spawn_net_endpoint* ep, lwgrp_comm* comm)
 
     /* exchange endpoint address on ring */
     int ring_rank, ring_size;
-    char val[128];
-    char left[128];
-    char right[128];
+    char val[128], left[128], right[128];
     snprintf(val, sizeof(val), "%s", ep_name);
     ring(rank, size, val, &ring_rank, &ring_size, left, right, 128);
 
@@ -84,9 +82,9 @@ void comm_create(int rank, int size, spawn_net_endpoint* ep, lwgrp_comm* comm)
     comm->node = lwgrp_split_str(comm->world, hostname);
 
     /* get comm of leaders (procs having same rank in node communicator) */
-    int rank_world = lwgrp_rank(comm->world);
-    int rank_intra = lwgrp_rank(comm->node);
-    comm->leaders = lwgrp_split(comm->world, rank_intra, rank_world);
+    int64_t color = lwgrp_rank(comm->node);
+    int64_t key   = lwgrp_rank(comm->world);
+    comm->leaders = lwgrp_split(comm->world, color, key);
 
     return;
 }
@@ -141,7 +139,7 @@ int main(int argc, char **argv)
         strmap_setf(map, "val=%s", "hello world");
     }
     lwgrp_allgather_strmap(map, comm.node);
-    uint64_t rank_node = lwgrp_rank(comm.node);
+    int64_t rank_node = lwgrp_rank(comm.node);
     if (rank_node == 0) {
         lwgrp_allgather_strmap(map, comm.leaders);
     }
