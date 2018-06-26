@@ -34,8 +34,8 @@ and perform collectives like broadcast and allreduce.
 [bcast.c](bcast.c) - use strmap to broadcast data to all ranks
 
 ## Allgather
-An MPI library may wish to gather a network adress for each process
-that is used to establish a connection with a remote rank.
+An MPI library may wish to gather a network address for each process
+to establish a connection with a remote rank.
 This is often done by executing an allgather across processes using PMI.
 Here are two alternatives showing this allgather using spawnnet.
 
