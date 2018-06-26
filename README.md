@@ -27,12 +27,19 @@ See the following headers for more details:
   lwgrp.h
   spawn_util.h
   spawn_net_util.h
-
-To buid with IBUD support:
+  
+To build from a clone, review and run the buildme scripts:
 
 ````
+# do this once to fetch and build necessary autotools versions
+./buildme_autotools
+
+# do this each time to build
+./buildme
+
+# or alternatively
 ./configure \
-  --prefix=$installdir \
+  --prefix=`pwd`/install \
   LDFLAGS="-libverbs" \
   --disable-silent-rules
 make
