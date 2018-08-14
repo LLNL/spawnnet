@@ -1,7 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <slurm/pmi2.h>
+//#include <slurm/pmi2.h>
+#include "pmi2.h"
 
 // shared mem
 #include <sys/mman.h>
@@ -79,6 +80,11 @@ void ring(int rank, int size, const char* val, int* ring_rank, int* ring_size, c
     PMIX_Ring(val, ring_rank, ring_size, left, right, len);
 #else
     /* ring exchange the harder way with PMI2_Put/Fence/Get calls */
+
+    /* use our PMI rank and size for our ring rank and size values */
+    *ring_rank = rank;
+    *ring_size = size;
+
     /* put our value */
     char key[128];
     sprintf(key, "ring%d", rank);

@@ -22,6 +22,10 @@ void ring(int rank, int size, const char* val, int* ring_rank, int* ring_size, c
 #else
     /* ring exchange the harder way with PMI2_Put/Fence/Get calls */
 
+    /* use our PMI rank and size for our ring rank and size values */
+    *ring_rank = rank;
+    *ring_size = size;
+
     /* put our value */
     char key[128];
     sprintf(key, "ring%d", rank);
