@@ -20,26 +20,7 @@ int main(int argc, char **argv)
     lwgrp_comm comm;
     comm_create(rank, size, ep, &comm);
 
-    /**********************
-     * barrier across all processes
-     **********************/
-    lwgrp_barrier(comm.world);
-
-    /**********************
-     * barrier between procs on the same node
-     **********************/
-    lwgrp_barrier(comm.node);
-
-    /**********************
-     * barrier across all processes (two-level version),
-     * procs on node signal their leader, barrier across leaders, leader signal procs on its node
-     **********************/
-    lwgrp_barrier(comm.node);
-    int64_t rank_node = lwgrp_rank(comm.node);
-    if (rank_node == 0) {
-        lwgrp_barrier(comm.leaders);
-    }
-    lwgrp_barrier(comm.node);
+    /* ... now can pass comm struct around to functions ... */
 
     /* free communicator */
     comm_free(&comm);

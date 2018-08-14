@@ -4,6 +4,7 @@
 #include <slurm/pmi2.h>
 
 #include "spawn.h"
+#include "comm.h"
 
 // execute ring exchange with PMIX_Ring or PMI2 calls
 //   rank      - IN  process rank as returned by PMI2_Init
@@ -14,7 +15,7 @@
 //   left      - OUT value from process whose ring_rank is one less than ours
 //   right     - OUT value from process whose ring_rank is one more than ours
 //   len       - IN  max length of any value across all processes
-void ring(int rank, int size, const char* val, int* ring_rank, int* ring_size, char* left, char* right, size_t len)
+static void ring(int rank, int size, const char* val, int* ring_rank, int* ring_size, char* left, char* right, size_t len)
 {
 #ifdef HAVE_PMIX_RING
     /* use PMIX_Ring for ring exchange */
@@ -59,12 +60,6 @@ void ring(int rank, int size, const char* val, int* ring_rank, int* ring_size, c
 #endif
 }
 
-typedef struct lwgrp_comm_t {
-  lwgrp* world;
-  lwgrp* node;
-  lwgrp* leaders;
-} lwgrp_comm;
-
 /* create world, node, and leader groups and store in comm struct */
 void comm_create(int rank, int size, spawn_net_endpoint* ep, lwgrp_comm* comm)
 {
@@ -101,32 +96,4 @@ void comm_free(lwgrp_comm* comm)
     lwgrp_free(&comm->world);
 
     return;
-}
-
-int main(int argc, char **argv)
-{
-    /* initialize PMI, get our rank and process group size */
-    int spawned, size, rank, appnum;
-    PMI2_Init(&spawned, &size, &rank, &appnum);
-
-    /* open and endpoint and get its name */
-    //spawn_net_endpoint* ep = spawn_net_open(SPAWN_NET_TYPE_IBUD);
-    spawn_net_endpoint* ep = spawn_net_open(SPAWN_NET_TYPE_TCP);
-
-    /* allocate communicator */
-    lwgrp_comm comm;
-    comm_create(rank, size, ep, &comm);
-
-    /* ... now can pass comm struct around to functions ... */
-
-    /* free communicator */
-    comm_free(&comm);
-
-    /* close our endpoint and channel */
-    spawn_net_close(&ep);
-
-    /* shut down PMI */
-    PMI2_Finalize();
-
-    return 0;
 }
