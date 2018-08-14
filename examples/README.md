@@ -21,7 +21,9 @@ For example, it is common to need a world group of all processes,
 a group of all processes on the same node,
 and another group of processes to serve as leader representative processes across nodes.
 
-[comm.c](comm.c) - demo to create world, node, and leader groups and package them into a single structure
+[comm.c](comm.c)     - demo to create world, node, and leader groups and package them into a single structure
+
+[create.c](create.c) - demo to create and free comm structure
 
 ## Barrier, Allreduce, Bcast
 In some cases, an MPI library may need to synchronize processes
