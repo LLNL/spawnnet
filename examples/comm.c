@@ -17,6 +17,16 @@
 //   len       - IN  max length of any value across all processes
 static void ring(int rank, int size, const char* val, int* ring_rank, int* ring_size, char* left, char* right, size_t len)
 {
+    /* can't trust PMI in singleton mode, so shortcut out */
+    if (size == 1) {
+        /* create a ring that loops back to ourself on each end */
+        *ring_rank = rank;
+        *ring_size = size;
+        strncpy(left,  val, len);
+        strncpy(right, val, len);
+        return;
+    }
+
 #ifdef HAVE_PMIX_RING
     /* use PMIX_Ring for ring exchange */
     PMIX_Ring(val, ring_rank, ring_size, left, right, len);
