@@ -1,7 +1,5 @@
 # change setting here to point to spawnnet install
 SPAWNDIR=../install
-PMI_INCDIR=/usr/global/tools/pmi4pmix/blueos_3_ppc64le_ib/build
-PMI_LIBDIR=/usr/global/tools/pmi4pmix/blueos_3_ppc64le_ib/lib
 
 all: clean
 	gcc -g -O0 -o create       create.c       comm.c -I. -I$(SPAWNDIR)/include -L$(SPAWNDIR)/lib -Wl,-rpath,$(SPAWNDIR)/lib -lspawn -lpmi2
